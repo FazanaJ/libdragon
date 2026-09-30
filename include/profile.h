@@ -6,8 +6,8 @@
 #ifndef PROFILE_H
 #define PROFILE_H
 
+#include "preview.h"
 #include "n64sys.h"
-#include "emux.h"
 #include <stdint.h>
 
 /** 
@@ -25,9 +25,6 @@
 #undef LIBDRAGON_PROFILE
 #define LIBDRAGON_PROFILE 0
 #endif
-
-#include "n64sys.h"
-#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,6 +51,7 @@ typedef struct {
 
 /**
  * @brief Initialize the profiler.
+ * @preview
  *
  * Initialize the profiler. This must be called before using any of the
  * PROFILE_* macros.
@@ -62,15 +60,19 @@ typedef struct {
  * 
  * @see #profile_parms_t
  */
+LIBDRAGON_PREVIEW_API
 void profile_init(profile_parms_t *parms);
 
 /**
  * @brief Close the profiler.
+ * @preview
  */
+LIBDRAGON_PREVIEW_API
 void profile_close(void);
 
 /**
  * @brief Reset the profiler.
+ * @preview
  * 
  * Reset the profiler. This will clear all accumulated profile data and reset
  * the counters to 0.
@@ -81,10 +83,28 @@ void profile_close(void);
  * @see #profile_parms_t
  * @see #profile_init
  */
+LIBDRAGON_PREVIEW_API
 void profile_reset(void);
 
 /**
+ * @brief First profile slot reserved to each subsystem.
+ *
+ * All subsystems share a single global array of profile slots, indexed by the
+ * slot number passed to the PROFILE_* macros. Several of them can be active at
+ * the same time (eg: video playback drives both a video decoder and the mixer),
+ * so each one reserves a distinct range: overlapping slot numbers would
+ * silently sum unrelated measurements into the same counter.
+ *
+ * Applications defining their own slots must start at #PROFILE_SLOT_USER.
+ */
+#define PROFILE_SLOT_AUDIO      0    ///< Mixer, xm64, mid64, VADPCM (32 slots)
+#define PROFILE_SLOT_MPEG1      32   ///< MPEG-1 video decoder (16 slots)
+#define PROFILE_SLOT_H264       48   ///< H.264 video decoder (16 slots)
+#define PROFILE_SLOT_USER       64   ///< First slot available to applications
+
+/**
  * @brief Register a new profile slot
+ * @preview
  * 
  * This function register a slot to be used with the PROFILE_* macros. It allows
  * to specify the name with which the slot will be identified in the dumps.
@@ -96,22 +116,26 @@ void profile_reset(void);
  * @see #profile_parms_t
  * @see #profile_init
  */
+LIBDRAGON_PREVIEW_API
 void profile_register(int slot, const char *name, int nest_level);
 
 /**
  * @brief Communicate to the profiler the target frame rate
+ * @preview
  *
  * This is an optional function that can be called to communicate to the
  * profiler the target frame rate. When the profiler is aware of the target
- * frame rate, it will be to show stats related to the expected deadline for
+ * frame rate, it will be used to show stats related to the expected deadline for
  * each frame (eg: how much CPU percentage is used on average in each frame).
  +
  * @param fps 			Target frame rate in frames per second
  */
+LIBDRAGON_PREVIEW_API
 void profile_set_target_fps(float fps);
 
 /**
  * @brief Mark the start of the next frame
+ * @preview
  * 
  * This function must be called at the end of each frame. It will accumulate the
  * profile data for the current frame and prepare the profiler for the next frame.
@@ -127,10 +151,12 @@ void profile_set_target_fps(float fps);
  * @see #profile_parms_t
  * @see #profile_dump
  */
+LIBDRAGON_PREVIEW_API
 void profile_next_frame(void);
 
 /**
  * @brief Dump the profiler data to the console
+ * @preview
  * 
  * This function will dump the current profiler data to the debugging channel.
  *
@@ -141,6 +167,7 @@ void profile_next_frame(void);
  *
  * @see #profile_reset
  */
+LIBDRAGON_PREVIEW_API
 void profile_dump(void);
 
 ///@cond
@@ -152,6 +179,7 @@ inline void __profile_record(int slot, int32_t len) {
 ///@endcond
 
 #if LIBDRAGON_PROFILE
+	#include "emux.h"
 	#include "pputils.h"
 
 	// Internal helpers to make the ordinal parameter optional in PROFILE_START/STOP.
@@ -250,15 +278,16 @@ inline void __profile_record(int slot, int32_t len) {
 	 * @see PROFILE_STOP
 	 */
 	#define PROFILE_SCOPE(slot) \
-		for (int64_t __prof_start_##slot = emux_prof_start(slot), TICKS_READ() - get_system_ticks() ; ) \
-			for (int __prof_once_##slot = ({ MEMORY_BARRIER(); 1; }); __prof_once_##slot; __prof_once_##slot = 0, \
-				({ MEMORY_BARRIER(); }), \
-				emux_prof_stop(slot), \
-				__profile_record(slot, TICKS_READ() - get_system_ticks() - __prof_start_##slot))
+		for (int64_t __prof_start_##slot = TICKS_READ() - get_system_ticks(), \
+			__prof_once_##slot = ({ emux_prof_start(slot); MEMORY_BARRIER(); (int64_t)1; }); \
+			__prof_once_##slot; \
+			__prof_once_##slot = 0, \
+			({ MEMORY_BARRIER(); emux_prof_stop(slot); \
+			   __profile_record(slot, TICKS_READ() - get_system_ticks() - __prof_start_##slot); }))
 #else
 	///@cond
-	#define PROFILE_START(slot, ...)  ((void)(false), false)
-	#define PROFILE_STOP(slot, ...)   ((void)(false), false)
+	#define PROFILE_START(slot, ...)  ((void)0)
+	#define PROFILE_STOP(slot, ...)   ((void)0)
 	#define PROFILE_SCOPE(slot)     for (bool __prof_once_##slot = true; __prof_once_##slot; __prof_once_##slot = false)
 	///@endcond
 

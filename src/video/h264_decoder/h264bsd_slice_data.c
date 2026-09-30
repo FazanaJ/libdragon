@@ -34,15 +34,11 @@
 ------------------------------------------------------------------------------*/
 
 #include "h264bsd_slice_data.h"
+#include "h264bsd_inter_prediction.h"
 #include "h264bsd_util.h"
 #include "h264bsd_vlc.h"
 
 #include "../profile.h"
-
-#ifdef H264BSD_N64
-#include "../rsph264_internal.h"
-#include "../fastcache.h"
-#endif
 
 /*------------------------------------------------------------------------------
     2. External compiler flags
@@ -101,6 +97,8 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
     u32 currMbAddr;
     u32 moreMbs;
     u32 mbCount;
+    u32 budget;
+    u32 doneThisCall;
     i32 qpY;
     macroblockLayer_t *mbLayer;
 
@@ -111,22 +109,38 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
     ASSERT(pStorage);
     ASSERT(pSliceHeader->firstMbInSlice < pStorage->picSizeInMbs);
 
-    currMbAddr = pSliceHeader->firstMbInSlice;
-    skipRun = 0;
-    prevSkipped = HANTRO_FALSE;
+    if (pStorage->sliceDataPending)
+    {
+        currMbAddr = pStorage->sliceMbAddr;
+        skipRun = pStorage->sliceSkipRun;
+        prevSkipped = pStorage->slicePrevSkipped;
+        mbCount = pStorage->sliceMbCount;
+        qpY = pStorage->sliceQpY;
+        pStorage->sliceDataPending = 0;
+    }
+    else
+    {
+        currMbAddr = pSliceHeader->firstMbInSlice;
+        skipRun = 0;
+        prevSkipped = HANTRO_FALSE;
+        mbCount = 0;
+        qpY = (i32)pStorage->activePps->picInitQp + pSliceHeader->sliceQpDelta;
 
-    /* increment slice index, will be one for decoding of the first slice of
-     * the picture */
-    pStorage->slice->sliceId++;
+#ifdef H264BSD_N64
+        h264bsdPrepareWeights(pSliceHeader);
+#endif
 
-    /* lastMbAddr stores address of the macroblock that was last successfully
-     * decoded, needed for error handling */
-    pStorage->slice->lastMbAddr = 0;
+        /* increment slice index, will be one for decoding of the first slice of
+         * the picture */
+        pStorage->slice->sliceId++;
 
-    mbCount = 0;
-    /* initial quantization parameter for the slice is obtained as the sum of
-     * initial QP for the picture and sliceQpDelta for the current slice */
-    qpY = (i32)pStorage->activePps->picInitQp + pSliceHeader->sliceQpDelta;
+        /* lastMbAddr stores address of the macroblock that was last successfully
+         * decoded, needed for error handling */
+        pStorage->slice->lastMbAddr = 0;
+    }
+
+    budget = pStorage->sliceMbBudget;
+    doneThisCall = 0;
     do
     {
         mbLayer = &pStorage->mbLayers[pStorage->mbLayerIdx];
@@ -199,22 +213,6 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
         }
 
         if (!prevSkipped) {
-            #if H264BSD_N64_CAVLC
-            // Read back the stream buffer pointer from RSP.
-            // This does a smart sync waiting just for the CAVLC
-            // function to finish (not a full sync).
-            rsph264_cur_cavlc_buffer((const u8**)&pStrmData->pStrmCurrPos, (int*)&pStrmData->bitPosInWord);
-
-            // Copy the totalCoeff into the macroblock. This is important
-            // because CAVLC will use totalCoeff of adjacent macroblocks.
-            // (to compute the "nc" value).
-            mbStorage_t *pMb = pStorage->mb + currMbAddr;
-            H264SwDecMemcpy(pMb->totalCoeff,
-                            mbLayer->residual.totalCoeff,
-                            27*sizeof(*pMb->totalCoeff));
-            pMb->totalCoeffMask = h264bsdTotalCoeffMask(pMb->totalCoeff);
-            #endif
-
             // Update the stream buffer read bits counter.
             #ifndef H264BSD_N64
             pStrmData->strmBuffReadBits =
@@ -229,6 +227,7 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
         if (pStorage->mb[currMbAddr].decoded == 1)
 #endif          
             mbCount++;
+        doneThisCall++;
 
         /* keep on processing as long as there is stream data left or
          * processing of macroblocks to be skipped based on the last skipRun is
@@ -251,6 +250,19 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
         {
             EPRINT("Next mb address");
             return(HANTRO_NOK);
+        }
+
+        /* Timeslice: pause after the budget so poll() can return to the game.
+         * State is kept in storage; strm bit position stays in *pStrmData. */
+        if (budget && moreMbs && doneThisCall >= budget)
+        {
+            pStorage->sliceDataPending = 1;
+            pStorage->sliceMbAddr = currMbAddr;
+            pStorage->sliceSkipRun = skipRun;
+            pStorage->slicePrevSkipped = prevSkipped;
+            pStorage->sliceMbCount = mbCount;
+            pStorage->sliceQpY = qpY;
+            return(HANTRO_OK);
         }
 
     } while (moreMbs);

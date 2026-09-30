@@ -37,9 +37,11 @@
 #ifndef __LIBDRAGON_AUDIO_XM64_H
 #define __LIBDRAGON_AUDIO_XM64_H
 
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "preview.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +64,7 @@ typedef struct xm64player_s {
 	xm_context_t *ctx;        ///< libxm context
 	int fd;                   ///< open handle of XM64 file
 	int first_ch;             ///< first channel used in the mixer
+	int stream_ramsz;         ///< RAM the mixer sample buffers take (set by #xm64player_play)
 	bool playing;             ///< playing flag
 	bool stop_requested;      ///< user requested stop playing
 	bool looping;             ///< true if the XM is configured to loop
@@ -188,6 +191,7 @@ void xm64player_close(xm64player_t *player);
 
 /**
  * @brief Configure the directory where external samples are stored.
+ * @preview
  * 
  * This function is used to set the directory where the external samples
  * are stored. It is only used for XM64 files that use external samples.
@@ -195,6 +199,7 @@ void xm64player_close(xm64player_t *player);
  * @param dir 		Directory where the external samples are stored. This
  * 					can be on any filesystem, even different from XM64's one.
  */
+LIBDRAGON_PREVIEW_API
 void xm64_set_extsampledir(const char *dir);
 
 #ifdef __cplusplus

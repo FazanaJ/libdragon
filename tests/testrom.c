@@ -124,7 +124,7 @@ static uint32_t myrand(void) {
 	} \
 })
 
-// ASSERT_EQUAL_FLAOT(a, b, msg): fail the test if a!=b (and log a/b as float values)
+// ASSERT_EQUAL_FLOAT(a, b, msg): fail the test if a!=b (and log a/b as float values)
 #define ASSERT_EQUAL_FLOAT(_a, _b, msg, ...) ({ \
 	float a = _a; float b = _b; \
 	if (a != b) { \
@@ -299,6 +299,7 @@ static const struct Testsuite
 	TEST_FUNC(test_rspq_cmd_multiple,        0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rspq_cmd_rapid,           0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rspq_wrap,                  0, TEST_FLAGS_NO_BENCHMARK),
+	TEST_FUNC(test_rspq_buffer_handoff_atomic, 0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rspq_high_load,             0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rspq_load_overlay,          0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rspq_switch_overlay,        0, TEST_FLAGS_NO_BENCHMARK),
@@ -356,6 +357,7 @@ static const struct Testsuite
 	TEST_FUNC(test_rdpq_autotmem,              0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_autotmem_reuse,        0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_texrect_passthrough,   0, TEST_FLAGS_NO_BENCHMARK),
+	TEST_FUNC(test_rdpq_triangle_block_order,  0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_triangle,              0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_triangle_w1,           0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_text_metrics_empty,       0, TEST_FLAGS_NO_BENCHMARK),
@@ -405,6 +407,7 @@ static const struct Testsuite
 	TEST_FUNC(test_rdpq_tex_upload_multi,      0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_tex_can_upload,        0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_tex_blit_normal,       0, TEST_FLAGS_NO_BENCHMARK),
+	TEST_FUNC(test_rdpq_tex_blit_filtering,    0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_tex_multi_i4,          0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_tex_upload_tlut,       0, TEST_FLAGS_NO_BENCHMARK),
 	TEST_FUNC(test_rdpq_tex_upload_tlut_alignments, 0, TEST_FLAGS_NO_BENCHMARK),
@@ -601,5 +604,5 @@ int main() {
 
 	console_set_debug(true);
 	printf("\nTestsuite finished in %02lld:%02lld\n", total_time/60, total_time%60);
-	printf("Passed: %d out of %d (%d skipped)\n", successes, NUM_TESTS, skipped);
+	printf("Passed: %d out of %d (%d skipped)\n", successes, NUM_TESTS-skipped, skipped);
 }

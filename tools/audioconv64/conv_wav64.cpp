@@ -12,14 +12,17 @@
 #define _GNU_SOURCE
 #endif
 
+#include <assert.h>
 #include <string.h>
 #include <vector>
 #include <array>
 #include <algorithm>
 #include <time.h>
 #include <unordered_set>
-#include "../../src/audio/wav64_internal.h"
 #include "../common/binout.h"
+#include "../common/polyfill.h"
+#include "audioconv64.h"
+#include "../../src/audio/wav64_internal.h"
 
 #define DR_WAV_IMPLEMENTATION
 #include "../common/dr_wav.h"
@@ -30,20 +33,27 @@
 #include "libvadpcm.h"
 #include "libsamplerate.h"
 #include "libopus.h"
+#include "libulc.h"
 
 #include "huff_vadpcm.c"
-#include "conv_common.h"
+
+// Shared parsing helpers for --wav-seek (same syntax as videoconv64 --seek)
+#include "../common/seekfile.cpp"
 
 bool flag_wav_looping = false;
 int flag_wav_looping_offset = 0;
 int flag_wav_compress = 1;
 int flag_wav_compress_vadpcm_huffman = -1;
 int flag_wav_compress_vadpcm_bits = 4;
+ulc_mode_t flag_wav_compress_ulc_mode = ULC_MODE_VBR;
+float flag_wav_compress_ulc_bitrate = 64.0f;
+float flag_wav_compress_ulc_quality = 50.0f;
 int flag_wav_resample = 0;
 double flag_wav_seek_interval_sec = 0.0;
 const char *flag_wav_seek_file = NULL;
 bool flag_wav_mono = false;
 const int OPUS_SAMPLE_RATE = 48000;
+const int ULC_BLOCK_SIZE = 1024;
 
 static bool read_wav(const char *infn, wav_data_t *out)
 {
@@ -68,6 +78,7 @@ static bool read_wav(const char *infn, wav_data_t *out)
 	out->sampleRate = wav.sampleRate;
 
 	// Check if we find smpl metadata, and if so, extract the loop points.
+	// Keep samples past the loop end as a release tail.
 	for (int i=0; i<wav.metadataCount; i++) {
 		if (wav.pMetadata[i].type == drwav_metadata_type_smpl) {
 			drwav_smpl* smpl = &wav.pMetadata[i].data.smpl;
@@ -76,34 +87,39 @@ static bool read_wav(const char *infn, wav_data_t *out)
 				drwav_smpl_loop* loop = &smpl->pLoops[0];
 				out->looping = true;
 				out->loopOffset = loop->firstSampleOffset;
-				if (out->cnt > loop->lastSampleOffset+1)
-					out->cnt = loop->lastSampleOffset+1;
+				out->loopEnd = loop->lastSampleOffset + 1;
+				if (out->loopEnd > out->cnt)
+					out->loopEnd = out->cnt;
 
 				switch (loop->type) {
 				case 0: // standard forward loop
 					if (flag_verbose)
-						fprintf(stderr, "  found forward loop [start=%d end=%d cnt=%d]\n", loop->firstSampleOffset,
-							loop->lastSampleOffset, out->cnt);
+						fprintf(stderr, "  found forward loop [start=%d end=%d cnt=%d release=%d]\n",
+							loop->firstSampleOffset, loop->lastSampleOffset, out->cnt,
+							out->cnt - out->loopEnd);
 					break;
 				case 1: { // ping-pong loop
 					if (flag_verbose)
 						fprintf(stderr, "  found ping-pong loop [start=%d end=%d cnt=%d]\n", loop->firstSampleOffset,
 							loop->lastSampleOffset, out->cnt);
-					// Unroll the ping-pong loop in the buffer.
+					// Unroll the ping-pong into a terminal forward loop; any
+					// release past the original loop end is dropped.
 					int last_offset = loop->lastSampleOffset;
 					int first_offset = loop->firstSampleOffset;
 					int loop_len = last_offset - first_offset + 1;
-					int16_t* new_samples = (int16_t*)malloc((out->cnt + loop_len) * out->channels * sizeof(int16_t));
-					memcpy(new_samples, samples, out->cnt * out->channels * sizeof(int16_t));
+					int keep = out->loopEnd;
+					int16_t* new_samples = (int16_t*)malloc((keep + loop_len) * out->channels * sizeof(int16_t));
+					memcpy(new_samples, samples, keep * out->channels * sizeof(int16_t));
 					for (int i=0; i<loop_len; i++) {
 						for (int j=0; j<wav.channels; j++) {
-							new_samples[out->cnt * wav.channels + i * wav.channels + j] = samples[(last_offset - i) * wav.channels + j];
+							new_samples[keep * wav.channels + i * wav.channels + j] = samples[(last_offset - i) * wav.channels + j];
 						}
 					}
 					free(samples);
 					out->samples = new_samples;
-					out->cnt += loop_len;
-					out->loopOffset = out->cnt - loop_len;
+					out->cnt = keep + loop_len;
+					out->loopOffset = keep;
+					out->loopEnd = out->cnt;
 				}	break;
 				default:
 					fprintf(stderr, "WARNING: %s: loop type %d not supported\n", infn, loop->type);
@@ -172,6 +188,45 @@ static void resample_progress_print(int64_t bytes_done, int64_t bytes_total, int
 }
 
 /**
+ * Insert @p ncopy samples of the loop prefix at @p loopEnd, shifting the
+ * release tail forward. Both loop bounds advance by @p ncopy so the loop
+ * content is a rotation of the original (used to align loopStart).
+ *
+ * The copy runs a little past the new loop end, over the first samples of the
+ * shifted tail. The rotation leaves those out of phase with the loop, and the
+ * compressed frame that straddles the loop end would have to encode the jump
+ * together with the last samples of the loop, on a single scale factor: enough
+ * to flatten them, and the loop is what plays over and over. Rewriting up to
+ * the frame boundary also covers the taps the resampler reads past the loop.
+ */
+static void wav_rotate_loop_at_end(wav_data_t *wav, int ncopy)
+{
+	const int FRAME = kVADPCMFrameSampleCount;
+	int ch = wav->channels;
+	int loop_end = wav->loopEnd ? wav->loopEnd : wav->cnt;
+	int loop_len = loop_end - wav->loopOffset;
+	int tail = wav->cnt - loop_end;
+	assert(ncopy > 0 && loop_len > 0 && tail >= 0);
+
+	int end = loop_end + ncopy;
+	int over = (end + 3 + FRAME-1) / FRAME * FRAME - end;
+	if (over > tail) over = tail;
+
+	wav->samples = (int16_t*)realloc(wav->samples, (wav->cnt + ncopy) * ch * sizeof(int16_t));
+	memmove(&wav->samples[end * ch],
+		&wav->samples[loop_end * ch],
+		tail * ch * sizeof(int16_t));
+	for (int i = 0; i < ncopy + over; i++) {
+		int src = wav->loopOffset + (i % loop_len);
+		for (int c = 0; c < ch; c++)
+			wav->samples[(loop_end + i) * ch + c] = wav->samples[src * ch + c];
+	}
+	wav->cnt += ncopy;
+	wav->loopOffset += ncopy;
+	wav->loopEnd = end;
+}
+
+/**
  * @brief Write a WAV64 file, optionally compressing it.
  * 
  * @param infn 			Input file name (used only for diagnostics)
@@ -185,19 +240,26 @@ static void resample_progress_print(int64_t bytes_done, int64_t bytes_total, int
  * After the call:
  *   wav->samples might have been reallocated to a different buffer, and the original one freed
  * 
- * Consider the function might have to change the wav->cnt and wav->loopOffset
+ * Consider the function might have to change the wav->cnt / loopOffset / loopEnd
  * values to make them compatible with the compression format (eg: padding, realigning).
  */
 bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav, int format)
 {
 	bool failed = false;
 	int basepos = ftell(out);
-	
-	// Adjust loops for playback constraints
-	int loop_len = wav->looping ? wav->cnt - wav->loopOffset : 0;
-	if (loop_len < 0) {
-		fprintf(stderr, "WARNING: %s: invalid looping offset: %d (size: %d)\n", infn, wav->loopOffset, wav->cnt);
+
+	// Terminal loop if none was set explicitly.
+	if (wav->looping && wav->loopEnd == 0)
+		wav->loopEnd = wav->cnt;
+	int loop_end = wav->looping ? wav->loopEnd : 0;
+	int loop_len = wav->looping ? loop_end - wav->loopOffset : 0;
+	if (loop_len < 0 || loop_end > wav->cnt) {
+		fprintf(stderr, "WARNING: %s: invalid loop %d..%d (size: %d)\n",
+			infn, wav->loopOffset, loop_end, wav->cnt);
 		loop_len = 0;
+		loop_end = 0;
+		wav->looping = false;
+		wav->loopEnd = 0;
 	}
 
 	switch (format) {
@@ -212,45 +274,63 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 		break;
 
 	case 1: { // vadpcm 
-		// We need the loop point to be aligned to the VADPCM frame size (16 samples).
-		// This allows the VADPCM decoder to be simpler when looping, as it doesn't
-		// have to decode and discard partial frames.
-		// Moreover, we even force an alignment to *even* frames (32 samples) because
-		// this gurantees the source ROM pointer is even, which means that direct DMA
-		// will be performed during decoding, with no memcpy.
-		// To do so, move forward the loop point until the next frame boundary,
-		// and copy the skipped samples to the end of the buffer.
+		// Align loopStart to 32 samples (even VADPCM frames) by rotating the
+		// skipped prefix into the loop end — not past sample_end, so a release
+		// tail stays after the loop.
 		enum { VADCPM_ALIGN = 32 };
 		if (wav->looping && (wav->loopOffset % VADCPM_ALIGN) != 0) {
-			int ncopy = VADCPM_ALIGN - (wav->loopOffset % VADCPM_ALIGN);
-			
-			wav->samples = (int16_t*)realloc(wav->samples, (wav->cnt + ncopy) * wav->channels * sizeof(int16_t));
-			// Manually copy the samples to the end of the buffer, so that
-			// we handle the case of a loop length smaller than the copy size.
-			for (int i=0; i<ncopy * wav->channels; i++) {
-				wav->samples[wav->cnt * wav->channels + i] = wav->samples[wav->loopOffset * wav->channels + i];
-			}
-			wav->cnt += ncopy;
-			wav->loopOffset += ncopy;
-			loop_len = wav->cnt - wav->loopOffset;
+			wav_rotate_loop_at_end(wav, VADCPM_ALIGN - (wav->loopOffset % VADCPM_ALIGN));
+			loop_end = wav->loopEnd;
+			loop_len = loop_end - wav->loopOffset;
 		}
 
 		wav->bitsPerSample = 16; // VADPCM always uses 16-bit samples
 	} 	break;
 
+	case 2: { // ulc
+		wav->bitsPerSample = 16; // ULC always uses 16-bit source samples
+
+		// Keep the logical waveform length on an 8-byte boundary so that full-file
+		// loops always append decoded blocks at an aligned RDRAM address. ULC pads
+		// the encoded stream to whole 1024-frame blocks independently.
+		const int frame_bytes = wav->channels * sizeof(int16_t);
+		int frame_align = 1;
+		while ((frame_align * frame_bytes) & 7) {
+			frame_align++;
+		}
+
+		if (wav->looping && (wav->loopOffset % ULC_BLOCK_SIZE) != 0) {
+			wav_rotate_loop_at_end(wav, ULC_BLOCK_SIZE - (wav->loopOffset % ULC_BLOCK_SIZE));
+			loop_end = wav->loopEnd;
+			loop_len = loop_end - wav->loopOffset;
+		}
+
+		wav->cnt -= wav->cnt % frame_align;
+		if (wav->looping && wav->loopEnd > wav->cnt)
+			wav->loopEnd = wav->cnt;
+		loop_end = wav->looping ? wav->loopEnd : 0;
+		loop_len = wav->looping ? loop_end - wav->loopOffset : 0;
+	} break;
+
 	case 3: // opus:
-		wav->bitsPerSample = 16; // Opus always uses 16-bit samples
+		wav->bitsPerSample = 16; // Opus always uses 16-bit source samples
 		break;
 	}
 
+	// Recompute after alignment. On disk, 0 means terminal (loop_end == len).
+	loop_end = wav->looping ? (wav->loopEnd ? wav->loopEnd : wav->cnt) : 0;
+	loop_len = wav->looping ? loop_end - wav->loopOffset : 0;
+	int loop_end_disk = (wav->looping && loop_end < wav->cnt) ? loop_end : 0;
+
 	fwrite("WV64", 1, 4, out);
-	w8(out, 6); 				 			// version
+	w8(out, 10);							// version
 	w8(out, format);  						// format
 	w8(out, wav->channels);					// channels
 	w8(out, wav->bitsPerSample);			// bits
 	w32(out, wav->sampleRate);				// frequency
 	w32(out, wav->cnt);						// len
 	w32(out, loop_len);						// loop_len
+	w32(out, loop_end_disk);				// loop_end (0 means len)
 	w32_placeholderf(out, "%s/samples", outfn);		// offset where samples begin
 	w32_placeholderf(out, "%s/state_size", outfn);    // size of per-mixer-channel state to allocate at runtime
 
@@ -276,6 +356,16 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 	} break;
 
 	case 1: { // vadpcm
+		// Sub-nibble residuals are packed natively in the bitstream, which
+		// leaves nothing for Huffman to exploit: it works on nibbles and both
+		// schemes squeeze the same redundancy.
+		if (flag_wav_compress_vadpcm_bits < 4 && flag_wav_compress_vadpcm_huffman) {
+			if (flag_verbose)
+				fprintf(stderr, "  %d-bit residuals are packed natively: disabling huffman\n",
+					flag_wav_compress_vadpcm_bits);
+			flag_wav_compress_vadpcm_huffman = 0;
+		}
+
 		// The state is 16+4+4 bytes per channel (see wav64_state_vadpcm_t), but the runtime code requires to
 		// always allocate both channels even for mono files.
 		placeholder_set_offset(out, 48, "%s/state_size", outfn);
@@ -289,7 +379,18 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 		if (wav->cnt % VADPCM_ALIGN) {
 			int newcnt = (wav->cnt + VADPCM_ALIGN - 1) / VADPCM_ALIGN * VADPCM_ALIGN;
 			wav->samples = (int16_t*)realloc(wav->samples, newcnt * wav->channels * sizeof(int16_t));
-			memset(wav->samples + wav->cnt, 0, (newcnt - wav->cnt) * wav->channels * sizeof(int16_t));
+			// The padding shares a frame with real samples, and a frame carries
+			// a single scale factor: padding with silence would spend the whole
+			// residual range on the jump to zero and flatten the real samples
+			// next to it. Continue the waveform instead, with the samples that
+			// really play next (the loop start) or by holding the last one.
+			for (int i = wav->cnt; i < newcnt; i++) {
+				int src = loop_len > 0
+					? wav->loopOffset + (i - wav->cnt) % loop_len
+					: wav->cnt - 1;
+				for (int c = 0; c < wav->channels; c++)
+					wav->samples[i * wav->channels + c] = wav->samples[src * wav->channels + c];
+			}
 			wav->cnt = newcnt;
 		}
 
@@ -300,6 +401,8 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 		struct vadpcm_vector *codebook = (struct vadpcm_vector *)alloca(kPREDICTORS * kVADPCMEncodeOrder * wav->channels * sizeof(struct vadpcm_vector));
 		struct vadpcm_params parms = { 
 			.predictor_count = kPREDICTORS,
+			// Match previous encoder behavior (always dithered residuals).
+			.dither = kVADPCMDitherRectangular,
 			.min_residual = -(1 << (flag_wav_compress_vadpcm_bits-1)),
 			.max_residual = (1 << (flag_wav_compress_vadpcm_bits-1)) - 1
 		};
@@ -326,6 +429,14 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 
 		std::vector<int> skip_bitpos(skip_points.size(), 0);
 		std::vector<std::array<vadpcm_vector, 2>> skip_state(skip_points.size());
+		// First three samples decoded at the loop start, stored after each
+		// channel's codebook so the mixer can Hermite across the loop point.
+		std::array<std::array<int16_t, 3>, 2> loop_head = {};
+		int loop_start_aligned = -1;
+		if (wav->looping) {
+			loop_start_aligned = (wav->loopOffset + kVADPCMFrameSampleCount - 1)
+				/ kVADPCMFrameSampleCount * kVADPCMFrameSampleCount;
+		}
 
 		int16_t *schan = (int16_t*)malloc(wav->cnt * sizeof(int16_t));
 		for (int i=0; i<wav->channels; i++) {
@@ -357,13 +468,41 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 					}
 
 					skip_state[j][i] = st;
+					// The loop taps are the first three samples of the frame the
+					// loop resumes on: decode that one frame on a copy of the
+					// state so the forward pass is not disturbed.
+					if (skip_points[j] == loop_start_aligned && target_frame < nframes) {
+						struct vadpcm_vector st_head = st;
+						int16_t head[kVADPCMFrameSampleCount];
+						vadpcm_error herr = vadpcm_decode(kPREDICTORS, kVADPCMEncodeOrder,
+							codebook + kPREDICTORS * kVADPCMEncodeOrder * i,
+							&st_head, 1, head,
+							destchan + (size_t)target_frame * kVADPCMFrameByteSize);
+						assert(herr == kVADPCMErrNone);
+						loop_head[i][0] = head[0];
+						loop_head[i][1] = head[1];
+						loop_head[i][2] = head[2];
+					}
 					cur_frame = target_frame;
 				}
 			}
 
-			// Copy encoded samples to output buffer
-			for (int j=0; j<nframes; j++)
-				memcpy(dest + (i + wav->channels * j) * kVADPCMFrameByteSize, destchan + j * kVADPCMFrameByteSize, kVADPCMFrameByteSize);
+			// Block-planar layout: for each block of B frames, all L then all R
+			// (mono unchanged). One ring fill maps to one file block.
+			const int B = 128;
+			for (int j=0; j<nframes; j++) {
+				int dstj;
+				if (wav->channels == 1) {
+					dstj = j;
+				} else {
+					int block = j / B;
+					int off = j % B;
+					int nblocks = (nframes + B - 1) / B;
+					int bs = (block == nblocks - 1) ? (nframes - block * B) : B;
+					dstj = block * B * wav->channels + i * bs + off;
+				}
+				memcpy(dest + dstj * kVADPCMFrameByteSize, destchan + j * kVADPCMFrameByteSize, kVADPCMFrameByteSize);
+			}
 			free(destchan);
 		}
 		free(schan);
@@ -401,33 +540,54 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 			assert((bitpos+7)/8 == compbuflen);
 			assert(memcmp(&scratch[0], dest, dest_size) == 0);
 
-			// Compute bit offset for each skip point (O(1) lookup from full decode stats)
-			for (int i=0; i<skip_points.size(); i++) {
-				int blocks = (skip_points[i] / kVADPCMFrameSampleCount) * wav->channels;
-				assert(blocks >= 0);
-				assert(blocks < (int)bitpos_stats.size());
-				skip_bitpos[i] = bitpos_stats[blocks];
+			// Compute bit offset for each skip point (O(1) lookup from full decode stats).
+			// Bitpos is the start of channel-0's frame F in the block-planar stream,
+			// so seeking can resume Huffman decoding from that point.
+			const int B = 128;
+			for (int i=0; i<(int)skip_points.size(); i++) {
+				int F = skip_points[i] / kVADPCMFrameSampleCount;
+				int idx;
+				if (wav->channels == 1) {
+					idx = F;
+				} else {
+					int block = F / B;
+					int off = F % B;
+					idx = block * B * wav->channels + off; // channel 0 within block
+				}
+				assert(idx >= 0);
+				assert(idx < (int)bitpos_stats.size());
+				skip_bitpos[i] = bitpos_stats[idx];
 			}
 		}
 
 		uint8_t flags = 0;
 		if (flag_wav_compress_vadpcm_huffman) flags |= (1<<0);
+		if (wav->resident) flags |= (1<<1); // VADPCM_FLAG_RESIDENT
 
-		const int CODEBOOK_SIZE = kPREDICTORS * kVADPCMEncodeOrder * wav->channels;
+		// Per channel: 8 predictor vectors (128 bytes) + 3 loop taps + pad.
+		const int CODEBOOK_STRIDE = kPREDICTORS * kVADPCMEncodeOrder * 16 + 8;
+		const int codebook_bytes = CODEBOOK_STRIDE * wav->channels;
 		struct vadpcm_vector state = {0};
 		w8(out, kPREDICTORS);
 		w8(out, kVADPCMEncodeOrder);
 		w16(out, flags);
 		w16(out, skip_points.size());
-		w16(out, 0); // padding
+		w8(out, flag_wav_compress_vadpcm_bits);
+		w8(out, wav->attack_frames);
 		w32(out, 0); // huff_tbl_ptr
-		w32(out, skip_points.size() > 0 ? CODEBOOK_SIZE*16 : 0); // skip_points_ptr
-		w32(out, skip_points.size() > 0 ? CODEBOOK_SIZE*16 + skip_points.size()*8 : 0); // skip_states_ptr
+		w32(out, skip_points.size() > 0 ? codebook_bytes : 0); // skip_points_ptr
+		w32(out, skip_points.size() > 0 ? codebook_bytes + (int)skip_points.size()*8 : 0); // skip_states_ptr
 		fwrite(ctxbuf, 1, HUFF_CONTEXT_LEN, out);					 // Huffman context
 		w32(out, 0); // padding
-		for (int i=0; i<CODEBOOK_SIZE; i++)    // codebook
-			for (int j=0; j<8; j++)
-				w16(out, codebook[i].v[j]);
+		for (int ch=0; ch<wav->channels; ch++) {
+			struct vadpcm_vector *cb = codebook + kPREDICTORS * kVADPCMEncodeOrder * ch;
+			for (int i=0; i<kPREDICTORS * kVADPCMEncodeOrder; i++)
+				for (int j=0; j<8; j++)
+					w16(out, cb[i].v[j]);
+			for (int j=0; j<3; j++)
+				w16(out, loop_head[ch][j]);
+			w16(out, 0); // padding
+		}
 		// Write the skip points
 		for (int i=0; i<skip_points.size(); i++) {
 			w32(out, skip_points[i]);
@@ -442,10 +602,20 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 
 		// Start of samples data
 		placeholder_set_offset(out, ftell(out)-basepos, "%s/samples", outfn);
-		if (flag_wav_compress_vadpcm_huffman)
+		if (flag_wav_compress_vadpcm_huffman) {
 			fwrite(compbuf, 1, compbuflen, out);
-		else
+		} else if (flag_wav_compress_vadpcm_bits < 4) {
+			const int total_frames = nframes * wav->channels;
+			uint8_t *packed = (uint8_t*)malloc(total_frames * vadpcm_frame_bytes(flag_wav_compress_vadpcm_bits));
+			int packed_size = vadpcm_pack_frames(packed, dest, total_frames, flag_wav_compress_vadpcm_bits);
+			if (flag_verbose)
+				fprintf(stderr, "  packed %d bytes into %d bytes (ratio: %.1f%%)\n",
+					dest_size, packed_size, 100.0f * packed_size / dest_size);
+			fwrite(packed, 1, packed_size, out);
+			free(packed);
+		} else {
 			fwrite(dest, 1, nframes * kVADPCMFrameByteSize * wav->channels, out);
+		}
 
 		if (flag_debug) {
 			char* wav2fn = changeext(outfn, ".vadpcm.wav");
@@ -454,10 +624,22 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 			
 			int16_t *out_samples = (int16_t *)malloc(wav->cnt * wav->channels * sizeof(int16_t));
 			int16_t *out_channel = (int16_t *)malloc(wav->cnt * sizeof(int16_t));
+			const int B = 128;
 			for (int i=0;i<wav->channels;i++) {		
 				uint8_t *in_channel = (uint8_t*)malloc(nframes * kVADPCMFrameByteSize);
-				for (int j=0;j<nframes;j++)
-					memcpy(in_channel + j * kVADPCMFrameByteSize, dest + (i + wav->channels * j) * kVADPCMFrameByteSize, kVADPCMFrameByteSize);
+				for (int j=0;j<nframes;j++) {
+					int srcj;
+					if (wav->channels == 1) {
+						srcj = j;
+					} else {
+						int block = j / B;
+						int off = j % B;
+						int nblocks = (nframes + B - 1) / B;
+						int bs = (block == nblocks - 1) ? (nframes - block * B) : B;
+						srcj = block * B * wav->channels + i * bs + off;
+					}
+					memcpy(in_channel + j * kVADPCMFrameByteSize, dest + srcj * kVADPCMFrameByteSize, kVADPCMFrameByteSize);
+				}
 
 				memset(&state, 0, sizeof(state));
 				vadpcm_decode(kPREDICTORS, kVADPCMEncodeOrder,
@@ -491,6 +673,180 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 		free(dest);
 		free(compbuf);
 		free(ctxbuf);
+	} break;
+
+	case 2: { // ulc
+		const int blocks_len = (wav->cnt + ULC_BLOCK_SIZE - 1) / ULC_BLOCK_SIZE + 2;
+		struct ULC_EncoderState_t enc = {};
+		enc.RateHz = wav->sampleRate;
+		enc.nChan = wav->channels;
+		enc.BlockSize = ULC_BLOCK_SIZE;
+		if (ULC_EncoderState_Init(&enc) <= 0) {
+			fprintf(stderr, "ERROR: %s: cannot initialize ULC encoder\n", infn);
+			failed = true;
+			break;
+		}
+
+		std::vector<float> block(ULC_BLOCK_SIZE * wav->channels, 0.0f);
+		auto load_block = [&](int block_idx) {
+			std::fill(block.begin(), block.end(), 0.0f);
+			const int first = block_idx * ULC_BLOCK_SIZE;
+			for (int ch = 0; ch < wav->channels; ch++)
+				for (int i = 0; i < ULC_BLOCK_SIZE && first + i < wav->cnt; i++)
+					block[i * wav->channels + ch] = wav->samples[(first + i) * wav->channels + ch] / 32768.0f;
+		};
+
+		float avg_complexity = 0.0f;
+		if (flag_wav_compress_ulc_mode == ULC_MODE_ABR) {
+			double complexity_sum = 0.0;
+			for (int i = 0; i < blocks_len; i++) {
+				load_block(i);
+				ULC_EncodeBlock_VBR(&enc, block.data(), NULL, flag_wav_compress_ulc_quality);
+				complexity_sum += enc.BlockComplexity;
+			}
+			avg_complexity = (float)(complexity_sum / blocks_len);
+			if (avg_complexity <= 0.0f) avg_complexity = ULC_COEF_EPS;
+			ULC_EncoderState_Destroy(&enc);
+			enc = {};
+			enc.RateHz = wav->sampleRate;
+			enc.nChan = wav->channels;
+			enc.BlockSize = ULC_BLOCK_SIZE;
+			if (ULC_EncoderState_Init(&enc) <= 0) {
+				fprintf(stderr, "ERROR: %s: cannot initialize ULC ABR encoder\n", infn);
+				failed = true;
+				break;
+			}
+		}
+
+		w16(out, ULC_BLOCK_SIZE);
+		w16_placeholderf(out, "%s/ulc_max_block_size", outfn);
+		w32(out, blocks_len);
+		w32_placeholderf(out, "%s/ulc_bitrate", outfn);
+		w32_placeholderf(out, "%s/ulc_seek_table", outfn); // reserved: seek table offset
+
+		// Collect the first-block-relative offset of every eighth block. The table
+		// itself is written after the compressed stream.
+		const int seek_interval_blocks = 8;
+		const int seek_table_len = (blocks_len + seek_interval_blocks - 1) / seek_interval_blocks;
+		const int samples_start = ftell(out);
+		placeholder_set_offset(out, samples_start-basepos, "%s/samples", outfn);
+		std::vector<uint32_t> seek_offsets;
+		seek_offsets.reserve(seek_table_len);
+
+		// Fixed 32-bit target state, alignment slack, two temporary blocks per
+		// channel, and the persistent per-channel lap state. The two banks retain
+		// coefficients for both queued preroll blocks. Normal mono transforms
+		// overwrite coefficients directly in the output samplebuffer; normal
+		// stereo reuses the first bank as planar mid/side staging.
+		const int decoder_state_size = 24 /*sizeof(ulc_state_t)*/ + 63 +
+			sizeof(int16_t) * 2 * wav->channels * ULC_BLOCK_SIZE +
+			sizeof(int16_t) * wav->channels * (ULC_BLOCK_SIZE / 2);
+		placeholder_set_offset(out, decoder_state_size, "%s/state_size", outfn);
+
+		uint64_t total_bytes = 0;
+		int max_block_size = 0;
+		std::vector<std::vector<uint8_t>> debug_blocks;
+		if (flag_debug)
+			debug_blocks.reserve(blocks_len);
+		for (int i = 0; i < blocks_len; i++) {
+			if (i % seek_interval_blocks == 0)
+				seek_offsets.push_back(ftell(out)-samples_start);
+
+			load_block(i);
+			int size_bits = 0;
+			const void *encoded;
+			switch (flag_wav_compress_ulc_mode) {
+			case ULC_MODE_VBR:
+				encoded = ULC_EncodeBlock_VBR(&enc, block.data(), &size_bits, flag_wav_compress_ulc_quality);
+				break;
+			case ULC_MODE_ABR:
+				encoded = ULC_EncodeBlock_ABR(&enc, block.data(), &size_bits, flag_wav_compress_ulc_bitrate, avg_complexity);
+				break;
+			default:
+				encoded = ULC_EncodeBlock_CBR(&enc, block.data(), &size_bits, flag_wav_compress_ulc_bitrate);
+				break;
+			}
+			const int size_bytes = (size_bits + 7) / 8;
+			fwrite(encoded, 1, size_bytes, out);
+			if (flag_debug)
+				debug_blocks.emplace_back((const uint8_t *)encoded, (const uint8_t *)encoded + size_bytes);
+			total_bytes += size_bytes;
+			max_block_size = std::max(max_block_size, size_bytes);
+		}
+		assert((int)seek_offsets.size() == seek_table_len);
+		placeholder_set_offset(out, ftell(out)-samples_start, "%s/ulc_seek_table", outfn);
+		for (uint32_t offset : seek_offsets)
+			w32(out, offset);
+
+		const int actual_bitrate = (int)llround(total_bytes * 8.0 * wav->sampleRate / ((double)blocks_len * ULC_BLOCK_SIZE));
+		placeholder_set_offset(out, max_block_size, "%s/ulc_max_block_size", outfn);
+		placeholder_set_offset(out, actual_bitrate, "%s/ulc_bitrate", outfn);
+		if (flag_verbose)
+			fprintf(stderr, "  ULC: %d blocks, %.2f kbps (%s)\n", blocks_len, actual_bitrate / 1000.0,
+				flag_wav_compress_ulc_mode == ULC_MODE_ABR ? "ABR" :
+				flag_wav_compress_ulc_mode == ULC_MODE_CBR ? "CBR" : "VBR");
+
+		if (flag_debug) {
+			char* wav2fn = changeext(outfn, ".ulc.wav");
+			if (flag_verbose)
+				fprintf(stderr, "  writing uncompressed file %s\n", wav2fn);
+
+			struct ULC_DecoderState_t dec = {};
+			dec.nChan = wav->channels;
+			dec.BlockSize = ULC_BLOCK_SIZE;
+			if (ULC_DecoderState_Init(&dec) <= 0) {
+				fprintf(stderr, "ERROR: %s: cannot initialize ULC decoder\n", infn);
+				free(wav2fn);
+				failed = true;
+			} else {
+				int out_len = ULC_BLOCK_SIZE * blocks_len;
+				int out_pos = 0;
+				std::vector<int16_t> out_samples(out_len * wav->channels);
+				std::vector<float> decode_buffer(ULC_BLOCK_SIZE * wav->channels);
+
+				for (int i = 0; i < blocks_len; i++) {
+					int bits = ULC_DecodeBlock(&dec, decode_buffer.data(), debug_blocks[i].data());
+					if (bits <= 0) {
+						fprintf(stderr, "ERROR: %s: ULC decoding failed at block %d\n", infn, i);
+						failed = true;
+						break;
+					}
+
+					for (int j = 0; j < ULC_BLOCK_SIZE * wav->channels; j++) {
+						float v = decode_buffer[j] * 32768.0f;
+						if (v > 32767.0f) {
+							v = 32767.0f;
+						}
+						if (v < -32768.0f) {
+							v = -32768.0f;
+						}
+						out_samples[out_pos++] = v;
+					}
+				}
+
+				if (!failed) {
+					drwav_data_format fmt = {
+						.container = drwav_container_riff,
+						.format = DR_WAVE_FORMAT_PCM,
+						.channels = wav->channels,
+						.sampleRate = wav->sampleRate,
+						.bitsPerSample = 16,
+					};
+					drwav wav2;
+					if (!drwav_init_file_write(&wav2, wav2fn, &fmt, NULL)) {
+						fprintf(stderr, "ERROR: %s: cannot create WAV file\n", outfn);
+						failed = true;
+					} else {
+						drwav_write_pcm_frames(&wav2, out_len, out_samples.data());
+						drwav_uninit(&wav2);
+					}
+				}
+
+				ULC_DecoderState_Destroy(&dec);
+				free(wav2fn);
+			}
+		}
+		ULC_EncoderState_Destroy(&enc);
 	} break;
 
 	case 3: { // opus
@@ -630,13 +986,7 @@ bool wav64_write(const char *infn, const char *outfn, FILE *out, wav_data_t* wav
 				fprintf(stderr, "  writing uncompressed file %s\n", wav2fn);
 
 			out = fopen(outfn, "rb");
-			fseek(out, 20, SEEK_SET);
-			int start_offset = 0;
-			start_offset |= fgetc(out) << 24;
-			start_offset |= fgetc(out) << 16;
-			start_offset |= fgetc(out) << 8;
-			start_offset |= fgetc(out);
-			fseek(out, start_offset, SEEK_SET);
+			fseek(out, samples_start, SEEK_SET);
 			OpusCustomDecoder *dec = opus_custom_decoder_create(
 					custom_mode, wav->channels, &err);
 			if (err != OPUS_OK) {
@@ -705,7 +1055,7 @@ end:
 
 int wav_convert(const char *infn, const char *outfn) {
 	if (flag_verbose) {
-		const char *compr[4] = { "raw", "vadpcm", "raw", "opus" };
+		const char *compr[5] = { "raw", "vadpcm", "raw", "opus", "ulc" };
 		fprintf(stderr, "Converting: %s => %s (%s)\n", infn, outfn, compr[flag_wav_compress]);
 	}
 
@@ -736,6 +1086,8 @@ int wav_convert(const char *infn, const char *outfn) {
 		wav.loopOffset = flag_wav_looping_offset;
 	if (flag_wav_looping && !wav.looping)
 		wav.looping = true;
+	if (wav.looping && wav.loopEnd == 0)
+		wav.loopEnd = wav.cnt;
 
 	// Check if the user requested conversion to mono
 	if (flag_wav_mono && wav.channels == 2) {
@@ -903,6 +1255,8 @@ int wav_convert(const char *infn, const char *outfn) {
 
 		// Update loop/seek points to the new sample rate
 		wav.loopOffset = (int)((int64_t)wav.loopOffset * wavResampleTo / wav.sampleRate);
+		if (wav.loopEnd)
+			wav.loopEnd = (int)((int64_t)wav.loopEnd * wavResampleTo / wav.sampleRate);
 		for (size_t i = 0; i < wav.skipPoints.size(); i++) {
 			wav.skipPoints[i] = (int)((int64_t)wav.skipPoints[i] * wavResampleTo / wav.sampleRate);
 		}
@@ -916,6 +1270,7 @@ int wav_convert(const char *infn, const char *outfn) {
 	wav.skipPoints.erase(std::unique(wav.skipPoints.begin(), wav.skipPoints.end()), wav.skipPoints.end());
 
 	FILE *out = fopen(outfn, "wb");
+	placeholder_clear();
 	if (!out) {
 		fprintf(stderr, "ERROR: %s: cannot create file\n", outfn);
 		free(wav.samples);

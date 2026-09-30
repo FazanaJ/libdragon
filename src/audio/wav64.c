@@ -9,6 +9,7 @@
 #include "wav64_internal.h"
 #include "wav64_vadpcm_internal.h"
 #include "wav64_opus_internal.h"
+#include "wav64_ulc_internal.h"
 #include "mixer.h"
 #include "mixer_internal.h"
 #include "dragonfs.h"
@@ -25,6 +26,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <stdalign.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <malloc.h>
@@ -34,15 +36,12 @@
 /** ID of a WAVX file (big-endian WAV) */
 #define WAV_RIFX_ID   "RIFX"
 
-/** @brief Profile of DMA usage by WAV64, used for debugging purposes. */
-int64_t __wav64_profile_dma = 0;
-
 /** @brief None compression init function */
 static void wav64_none_init(wav64_t *wav, int state_size);
 /** @brief None compression get_bitrate function */
 static int wav64_none_get_bitrate(wav64_t *wav);
 
-static wav64_compression_t algos[4] = {
+static wav64_compression_t algos[WAV64_NUM_FORMATS] = {
 	// None compression
     [WAV64_FORMAT_RAW] = {
 		.init = wav64_none_init,
@@ -58,41 +57,46 @@ static wav64_compression_t algos[4] = {
 	},
 };
 
-static void raw_waveform_read(samplebuffer_t *sbuf, int current_fd, int wpos, int wlen, int bps) {
-	uint8_t* ram_addr = (uint8_t*)samplebuffer_append(sbuf, wlen);
-	int bytes = wlen << bps;
+static void raw_waveform_read(samplebuffer_t *sbuf, wav64_t *wav, int wpos, int wlen, int bps) {
+	uint32_t rom = wav->st->rom_base;
+	while (wlen > 0) {
+		int n = MIN(wlen, SAMPLEBUFFER_MARGIN_UNITS);
+		uint8_t* ram_addr = (uint8_t*)samplebuffer_append(sbuf, n);
+		int bytes = n << bps;
+		uint32_t pi_addr = rom + wav->st->base_offset + (wpos << bps);
 
-	// FIXME: remove CachedAddr() when read() supports uncached addresses
-	uint32_t t0 = TICKS_READ();
-	read(current_fd, CachedAddr(ram_addr), bytes);
-	__wav64_profile_dma += TICKS_READ() - t0;
+		if (rom && !(((uint32_t)ram_addr ^ pi_addr) & 1)) {
+			samplebuffer_dma_wait(sbuf);
+			sbuf->dma_ticket = dma_read_async(ram_addr, pi_addr, bytes);
+		} else {
+			lseek(wav->st->current_fd, wav->st->base_offset + (wpos << bps), SEEK_SET);
+			// FIXME: remove CachedAddr() when read() supports uncached addresses
+			read(wav->st->current_fd, CachedAddr(ram_addr), bytes);
+		}
+		wlen -= n;
+		wpos += n;
+	}
 }
 
 static void wav64_none_read(void *ctx, samplebuffer_t *sbuf, int wpos, int wlen, bool seeking) {
 	wav64_t *wav = (wav64_t*)sbuf->wave;
 	int bps = (wav->wave.bits == 8 ? 0 : 1) + (wav->wave.channels == 2 ? 1 : 0);
-	
-	// Always seek to allow for simultaneous playback on multiple channels with
-	// a single file descriptor
-	lseek(wav->st->current_fd, wav->st->base_offset + (wpos << bps), SEEK_SET);
-	raw_waveform_read(sbuf, wav->st->current_fd, wpos, wlen, bps);
-}
-
-static void wav64_none_read_memcopy(void *ctx, samplebuffer_t *sbuf, int wpos, int wlen, bool seeking) {
-	wav64_t *wav = (wav64_t*)sbuf->wave;
-	int bps = (wav->wave.bits == 8 ? 0 : 1) + (wav->wave.channels == 2 ? 1 : 0);
-	
-	uint8_t* src_addr = wav->st->samples + (wpos << bps);
-	uint8_t* dst_addr = (uint8_t*)samplebuffer_append(sbuf, wlen);
-	memcpy(dst_addr, src_addr, wlen << bps);
+	(void)ctx; (void)seeking;
+	raw_waveform_read(sbuf, wav, wpos, wlen, bps);
 }
 
 static void wav64_none_init(wav64_t *wav, int state_size) {
-	// Initialize none compression. Setup read callback
+	// Initialize none compression. Setup read callback for streaming;
+	// preloaded waveforms set wave->mem and need no read callback.
 	if (!wav->st->samples) {
 		wav->wave.read = wav64_none_read;
+		// Samples come straight from ROM via async PI DMA; a file on any other
+		// medium is read synchronously instead.
+		wav->wave.async_read = wav->st->rom_base != 0;
 	} else {
-		wav->wave.read = wav64_none_read_memcopy;
+		wav->wave.read = NULL;
+		wav->wave.async_read = false;
+		wav->wave.mem = wav->st->samples;
 	}
 	// Also clear start callback (needed in the preloading codepath)
 	wav->wave.start = NULL;
@@ -136,7 +140,8 @@ static wav64_t* internal_open(wav64_t *wav, int file_handle, const char *file_na
 		assertf(0, "wav64 %s: invalid ID: %02x%02x%02x%02x\n",
 			file_name, head.id[0], head.id[1], head.id[2], head.id[3]);
 	}
-	assertf(head.version == 6, "wav64 %s: invalid version: %02x\n",
+	assertf(head.version == 10,
+		"wav64 %s: unsupported version %02x; reconvert with audioconv64)",
 		file_name, head.version);
 	assertf(head.format < WAV64_NUM_FORMATS, "Unknown wav64 compression format %d; corrupted file?", head.format);
 	assertf(head.format < WAV64_NUM_FORMATS && algos[head.format].init != NULL,
@@ -144,8 +149,35 @@ static wav64_t* internal_open(wav64_t *wav, int file_handle, const char *file_na
 
 	int ext_size = head.start_offset - sizeof(wav64_header_t);
 	bool preload = parms->streaming_mode == WAV64_STREAMING_NONE;
-	int preload_size = ROUND_UP(head.len * head.channels * (head.nbits >> 3), 16);
-	int preload_extra_alloc = ROUND_UP(head.format == WAV64_FORMAT_RAW ? 0 : 4096, 16);
+	// VADPCM preloads stay compressed, laid out fully planar in RDRAM for
+	// direct MIX_CHANNEL addressing. The frame size depends on the residual
+	// width, which lives in the extended header: that is only read into its
+	// final home further down, so peek at its prefix to size the buffer.
+	bool preload_vadpcm = false;
+	int vframe_bytes = 0;
+	if (head.format == WAV64_FORMAT_VADPCM) {
+		uint8_t prefix[offsetof(wav64_header_vadpcm_t, huff_tbl)];
+		read(file_handle, prefix, sizeof(prefix));
+		lseek(file_handle, -(int)sizeof(prefix), SEEK_CUR);
+		int bits = prefix[offsetof(wav64_header_vadpcm_t, residual_bits)];
+		vframe_bytes = VADPCM_FRAME_BYTES(VADPCM_RESIDUAL_BITS(bits));
+		uint16_t vflags;
+		memcpy(&vflags, prefix + offsetof(wav64_header_vadpcm_t, flags), sizeof(vflags));
+		if (vflags & VADPCM_FLAG_RESIDENT)
+			preload = true;
+		preload_vadpcm = preload;
+	}
+	int nframes = WAV64_VADPCM_FRAMES(head.len);
+	int preload_size = preload_vadpcm
+		? ROUND_UP(nframes * vframe_bytes * head.channels, 16)
+		: ROUND_UP(head.len * head.channels * (head.nbits >> 3), 16);
+	if (preload && !preload_vadpcm) {
+		int ub = head.channels * (head.nbits >> 3);
+		preload_size += SAMPLEBUFFER_MARGIN_UNITS * ub;
+		preload_size = ROUND_UP(preload_size, 16);
+	}
+	int preload_extra_alloc = ROUND_UP(
+		(head.format == WAV64_FORMAT_RAW || preload_vadpcm) ? 0 : 4096, 16);
 	int state_size = ROUND_UP(head.state_size, 16);
 
 	// Calculate required allocation
@@ -153,7 +185,7 @@ static wav64_t* internal_open(wav64_t *wav, int file_handle, const char *file_na
 	heap_size += ROUND_UP(sizeof(wav64_state_t), 16);				// wav64_state_t
 
 	int heap_off_waveform = heap_size;
-	if (!wav) heap_size += ROUND_UP(sizeof(waveform_t), 16);		// Waveform
+	if (!wav) heap_size += ROUND_UP(sizeof(wav64_t), 16);		// wav64_t (wave + st)
 
 	int heap_off_name = heap_size;
 	heap_size += ROUND_UP(strlen(file_name) + 1, 16);				// Filename
@@ -185,7 +217,13 @@ static wav64_t* internal_open(wav64_t *wav, int file_handle, const char *file_na
 	wav->wave.frequency = head.freq;
 	wav->wave.len = head.len;
 	wav->wave.loop_len = head.loop_len;
+	wav->wave.loop_end = head.loop_end;
 	wav->wave.state_size = head.state_size;
+	int wloop_end = head.loop_end ? head.loop_end : head.len;
+	assertf(head.loop_len >= 0 && head.loop_len <= wloop_end &&
+		head.loop_end >= 0 && head.loop_end <= head.len,
+		"wav64 %s: invalid loop %d..%d (len %d)", file_name,
+		wloop_end - (int)head.loop_len, wloop_end, (int)head.len);
 
 	// Read ext data
 	read(file_handle, wav->st->ext, ext_size);
@@ -195,7 +233,10 @@ static wav64_t* internal_open(wav64_t *wav, int file_handle, const char *file_na
 	wav->st->format = head.format;
 	wav->st->current_fd = file_handle;
 	wav->st->base_offset = head.start_offset + start_offset;
-	wav->st->flags = owned_fd ? WAV64_FLAG_OWNED_FD : 0;
+	wav->st->flags = (owned_fd ? WAV64_FLAG_OWNED_FD : 0) |
+	                 (preload  ? WAV64_FLAG_PRELOAD  : 0);
+	wav->st->rom_base = 0;
+	ioctl(file_handle, IODFS_GET_ROM_BASE, &wav->st->rom_base);
 
 	// Initialize the compression algorithm
 	algos[wav->st->format].init(wav, head.state_size);
@@ -205,26 +246,51 @@ static wav64_t* internal_open(wav64_t *wav, int file_handle, const char *file_na
 		data_cache_hit_invalidate(heap + heap_off_samples, preload_size + preload_extra_alloc + state_size);
 		wav->st->samples = UncachedAddr(heap + heap_off_samples);
 
-		int wlen = wav->wave.len;
-		samplebuffer_t sbuf;
-		samplebuffer_init(&sbuf, wav->st->samples, preload_size + preload_extra_alloc, state_size);
-		samplebuffer_set_bps(&sbuf, wav->wave.bits);
-		samplebuffer_set_waveform(&sbuf, &wav->wave, wav->wave.read);
-		if (wav->wave.start) wav->wave.start(wav->wave.ctx, &sbuf);
-		samplebuffer_get(&sbuf, 0, &wlen);
-		rspq_highpri_sync();
-		assertf(wlen == wav->wave.len, "wav64: preload failed for %s: wlen=%x/%x", wav->wave.name, wlen, wav->wave.len);
+		if (wav->wave.format == WAVEFORM_FORMAT_VADPCM) {
+			wav64_vadpcm_preload(wav, wav->st->samples);
+			wav->wave.mem = wav->st->samples;
+			if (algos[wav->st->format].close)
+				algos[wav->st->format].close(wav);
+		} else {
+			samplebuffer_t sbuf;
+			samplebuffer_init(&sbuf, wav->st->samples, preload_size + preload_extra_alloc, state_size);
+			int wlen = wav->wave.len;
+			samplebuffer_set_bps(&sbuf, wav->wave.bits * wav->wave.channels);
+			samplebuffer_set_waveform(&sbuf, &wav->wave, wav->wave.read);
+			if (wav->wave.start) wav->wave.start(wav->wave.ctx, &sbuf);
+			samplebuffer_get(&sbuf, 0, &wlen);
+			samplebuffer_dma_wait(&sbuf);
+			rspq_highpri_sync();
+			assertf(wlen == wav->wave.len, "wav64: preload failed for %s: wlen=%x/%x", wav->wave.name, wlen, wav->wave.len);
 
-		// Now remove the extra allocation
-		if (algos[wav->st->format].close)
-			algos[wav->st->format].close(wav);
+			// Terminal loops: the RSP overreads past len, so pad the margin
+			// with the loop start. Non-terminal loops keep the release tail
+			// intact; streamed playback fills overread via #waveform_read.
+			if (wav->wave.loop_len && (!wav->wave.loop_end || wav->wave.loop_end == wav->wave.len)) {
+				int ub = wav->wave.channels * (wav->wave.bits >> 3);
+				int loop_start = wav->wave.len - wav->wave.loop_len;
+				uint8_t *base = (uint8_t *)wav->st->samples;
+				for (int i = 0; i < SAMPLEBUFFER_MARGIN_UNITS; i++)
+					memcpy(base + (wav->wave.len + i) * ub,
+						base + (loop_start + i % wav->wave.loop_len) * ub, ub);
+			}
 
-		wav->st = realloc(wav->st, heap_off_preload_end);
-		wav->st->ext = NULL;
+			if (algos[wav->st->format].close)
+				algos[wav->st->format].close(wav);
 
-		// Reinitialize as RAW format after preloading
-		wav->st->format = WAV64_FORMAT_RAW;
-		algos[wav->st->format].init(wav, head.state_size);
+			wav->st = realloc(wav->st, heap_off_preload_end);
+			wav->st->ext = NULL;
+
+			// Reinitialize as RAW format after preloading
+			wav->st->format = WAV64_FORMAT_RAW;
+			algos[wav->st->format].init(wav, head.state_size);
+		}
+
+		if (wav->st->current_fd >= 0 && (wav->st->flags & WAV64_FLAG_OWNED_FD)) {
+			close(wav->st->current_fd);
+			wav->st->current_fd = -1;
+			wav->st->flags &= ~WAV64_FLAG_OWNED_FD;
+		}
 	}
 
 	return wav;
@@ -268,7 +334,10 @@ double wav64_seek(wav64_t *wav, int ch, double time_sec)
 }
 
 void wav64_set_loop(wav64_t *wav, bool loop) {
+	// Full-file terminal loop (or disarm). Sustain loops with a release tail
+	// come from the file header; use #mixer_ch_set_loop to toggle those.
 	wav->wave.loop_len = loop ? wav->wave.len : 0;
+	wav->wave.loop_end = 0;
 
 	// Odd loop lengths are not supported for 8-bit waveforms because they would
 	// change the 2-byte phase between ROM and RDRAM addresses during loop unrolling.
@@ -301,6 +370,10 @@ void wav64_close(wav64_t *wav)
 			mixer_ch_stop(i);
 	}
 
+	// Wait for in-flight mix/decode rounds that may still reference
+	// codebook/state/ext before freeing the heap.
+	rspq_highpri_sync();
+
 	if (algos[wav->st->format].close)
 		algos[wav->st->format].close(wav);
 
@@ -313,6 +386,16 @@ void wav64_close(wav64_t *wav)
 
 	// Free the heap allocation (that might or might not include the wav64_t instance)
 	free(heap);
+}
+
+/** @brief Initialize wav64 compression level 2 */
+void __wav64_init_compression_lvl2(void)
+{
+	algos[WAV64_FORMAT_ULC] = (wav64_compression_t){
+		.init = wav64_ulc_init,
+		.get_bitrate = wav64_ulc_get_bitrate,
+		.adjust_seek = wav64_ulc_adjust_seek,
+	};
 }
 
 /** @brief Initialize wav64 compression level 3 */

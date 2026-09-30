@@ -104,11 +104,10 @@ static void waveform_opus_read(void *ctx, samplebuffer_t *sbuf, int wpos, int wl
     uint8_t alignas(16) buf[ext->max_cmp_frame_size + 1];
     int nframes = DIVIDE_CEIL(wlen + intra_skip, ext->frame_size);
 
-    // Make space for the decoded samples. Call samplebuffer_append once as we
-    // use RSP in background, and each call to the function might trigger a
-    // memmove of internal samples.
+    // Decode into one contiguous append (Opus frames are larger than the
+    // default samplebuffer margin; declare append_units so the mirrored
+    // tail covers a whole frame).
     int16_t *out = samplebuffer_append(sbuf, ext->frame_size*nframes);
-
     for (int i=0; i<nframes+preroll_frames; i++) {
         assert(wpos < wav->wave.len);
 
@@ -134,7 +133,9 @@ static void waveform_opus_read(void *ctx, samplebuffer_t *sbuf, int wpos, int wl
 
         int frame_size = ext->frame_size;
         if (i == preroll_frames && intra_skip > 0) {
+            rspq_highpri_begin();
             rsp_opus_memmove_bytes(out, out + intra_skip * wav->wave.channels, (ext->frame_size - intra_skip) * wav->wave.channels * sizeof(int16_t));
+            rspq_highpri_end();
             samplebuffer_undo(sbuf, intra_skip);
             frame_size -= intra_skip;
         }
@@ -147,7 +148,11 @@ static void waveform_opus_read(void *ctx, samplebuffer_t *sbuf, int wpos, int wl
 
     if (wav->wave.loop_len && wpos >= wav->wave.len) {
         assert(wav->wave.loop_len == wav->wave.len);
-        samplebuffer_undo(sbuf, wpos - wav->wave.len);
+        // Round the trim down for the same reason intra_skip is rounded above:
+        // the decoder writes through SP DMA, so the write cursor has to stay on
+        // a boundary the RSP can write to (see #samplebuffer_align_units), here
+        // for the loop overread the mixer appends right after this.
+        samplebuffer_undo(sbuf, ROUND_DOWN(wpos - wav->wave.len, samplebuffer_align_units(sbuf)));
     }
 }
 
@@ -163,6 +168,8 @@ void wav64_opus_init(wav64_t *wav, int state_size) {
 
     wav->wave.read = waveform_opus_read;
     wav->wave.start = waveform_opus_start;
+    wav->wave.append_units = ext->frame_size;
+    wav->wave.rsp_written = true;
 }
 
 void wav64_opus_close(wav64_t *wav) {

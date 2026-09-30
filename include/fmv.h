@@ -15,6 +15,7 @@
 #define LIBDRAGON_VIDEO_FMV_H
 
 #include <stdbool.h>
+#include "preview.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -161,11 +162,25 @@ typedef struct fmv_parms_s {
      * @param info      Video metadata from the opened stream
      */
     yuv_blitter_t (*create_yuv_blitter)(void *osd_ctx, video_info_t *info);
+
+    /**
+     * @brief Number of pictures to decode ahead of the current picture.
+     * 
+     * Decoding time can vary significantly between pictures. This parameter
+     * controls how many decoded pictures the player may buffer ahead, allowing
+     * faster pictures to compensate for slower ones and reducing the risk of
+     * playback stalls. Higher values can improve playback smoothness at the cost
+     * of increased memory usage.
+     * 
+     * If 0, defaults to 4 on a 4 MiB N64 and 8 with an Expansion Pak.
+     */
+    int decode_ahead_pics;
 } fmv_parms_t;
 
 
 /**
  * @brief Play a full-motion video from a video file
+ * @preview
  * 
  * This function plays a full-motion video from a video file, along with its
  * audio track if present. It takes care of everything: setting up the
@@ -198,6 +213,7 @@ typedef struct fmv_parms_s {
  * @param filename      Filename of the video file to play (including filesystem prefix)
  * @param parms         Additional parameters to customize playback (can be NULL)
  */
+LIBDRAGON_PREVIEW_API
 void fmv_play(const char *filename, const fmv_parms_t *parms);
 
 #ifdef __cplusplus

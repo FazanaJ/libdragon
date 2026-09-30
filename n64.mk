@@ -1,22 +1,29 @@
 BUILD_DIR ?= .
 SOURCE_DIR ?= .
 
+# Preview API policy (must be set before including this file):
+#   0 — using a preview API is a compile-time error (default)
+#   1 — preview APIs are usable but produce a compiler warning
+#   2 — preview APIs are fully unlocked (no diagnostics)
+LIBDRAGON_PREVIEW ?= 2
+
 # Override this if your project uses a different directory for your DFS filesystem root
 N64_MKDFS_ROOT ?= filesystem
 
-N64_ROM_TITLE = "Made with libdragon" # Override this with the name of your game or project
-N64_ROM_CATEGORY = # Set an N64 Media Category code in the ROM header (N, D, C, E, Z)
-N64_ROM_SAVETYPE = # Supported savetypes: none eeprom4k eeprom16 sram256k sram768k sram1m flashram
-N64_ROM_RTC = # Set to true to enable the Joybus Real-Time Clock
-N64_ROM_REGIONFREE ?= 1 # Set to true to allow booting on any console region
-N64_ROM_REGION = # Set to a region code (emulators will boot on a specific console region)
+N64_ROM_TITLE ?= "Made with libdragon" # Override this with the name of your game or project
+N64_ROM_CATEGORY ?= N # Set an N64 Media Category code in the ROM header (N, D, C, E, Z)
+N64_ROM_SAVETYPE ?= none # Supported savetypes: none eeprom4k eeprom16k sram256k sram768k sram1m flashram
+N64_ROM_EXPANSIONPAK ?= unspecified # Supported expansion pak types: unspecified unused recommended required
+N64_ROM_RTC ?= # Set to enable the Joybus Real-Time Clock
+N64_ROM_REGIONFREE ?= 1 # Set to allow booting on any console region
+N64_ROM_REGION ?= # Set to a region code (emulators will boot on a specific console region)
 N64_ROM_ELFCOMPRESS ?= 1 # Set compression level of ELF file in ROM
 N64_ROM_DSOCOMPRESS ?= 1 # Set compression level of DSOs file in ROM
-N64_ROM_CONTROLLER1 = # Sets the type of Controller 1 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
-N64_ROM_CONTROLLER2 = # Sets the type of Controller 2 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
-N64_ROM_CONTROLLER3 = # Sets the type of Controller 3 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
-N64_ROM_CONTROLLER4 = # Sets the type of Controller 4 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
-N64_ROM_METADATA = # Path to a metadata INI file to embed in the ROM. If set, invokes n64metadata.
+N64_ROM_CONTROLLER1 ?= # Sets the type of Controller 1 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
+N64_ROM_CONTROLLER2 ?= # Sets the type of Controller 2 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
+N64_ROM_CONTROLLER3 ?= # Sets the type of Controller 3 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
+N64_ROM_CONTROLLER4 ?= # Sets the type of Controller 4 in the Advanced Homebrew Header. This could influence emulator behaviour such as Ares'
+N64_ROM_METADATA ?= # Path to a metadata INI file to embed in the ROM. If set, invokes n64metadata.
 
 # Override this to use a different file prefix for the debug symbols. This is
 # useful when building multiple projects in the same directory and you can set
@@ -24,7 +31,7 @@ N64_ROM_METADATA = # Path to a metadata INI file to embed in the ROM. If set, in
 # .PHONY: tiny3d
 # tiny3d:
 # 	$(MAKE) -C $(T3D_INST) N64_BACKTRACE_FILE_PREFIX=tiny3d
-N64_BACKTRACE_FILE_PREFIX=
+N64_BACKTRACE_FILE_PREFIX ?=
 
 # Override this to use a toolchain installed separately from libdragon
 N64_GCCPREFIX ?= $(N64_INST)
@@ -83,6 +90,11 @@ N64_ASFLAGS = -mtune=vr4300 -march=vr4300 -mabi=o64 -Wa,--fatal-warnings -I$(N64
 N64_RSPASFLAGS = -march=mips1 -mabi=32 -Wa,--fatal-warnings -I$(N64_INCLUDEDIR)
 N64_LDFLAGS = -g -L$(N64_LIBDIR) -ldragon -lm -ldragonsys -Tn64.ld --gc-sections --wrap __do_global_ctors
 N64_DSOLDFLAGS = --emit-relocs --unresolved-symbols=ignore-all --nmagic -T$(N64_LIBDIR)/dso.ld
+ifneq ($(filter 1 2,$(LIBDRAGON_PREVIEW)),)
+N64_C_AND_CXX_FLAGS += -DLIBDRAGON_PREVIEW=$(LIBDRAGON_PREVIEW)
+N64_ASFLAGS += -DLIBDRAGON_PREVIEW=$(LIBDRAGON_PREVIEW)
+N64_RSPASFLAGS += -DLIBDRAGON_PREVIEW=$(LIBDRAGON_PREVIEW)
+endif
 
 N64_TOOLFLAGS = --toc
 N64_TOOLFLAGS += --title $(N64_ROM_TITLE)
@@ -90,6 +102,7 @@ N64_TOOLFLAGS += $(if $(N64_ROM_HEADER),--header $(N64_ROM_HEADER))
 N64_TOOLFLAGS += $(if $(N64_ROM_CATEGORY),--category $(N64_ROM_CATEGORY))
 N64_TOOLFLAGS += $(if $(N64_ROM_REGION),--region $(N64_ROM_REGION))
 N64_ED64ROMCONFIGFLAGS =  $(if $(N64_ROM_SAVETYPE),--savetype $(N64_ROM_SAVETYPE))
+N64_ED64ROMCONFIGFLAGS += $(if $(N64_ROM_EXPANSIONPAK),--expansionpak $(N64_ROM_EXPANSIONPAK))
 N64_ED64ROMCONFIGFLAGS += $(if $(N64_ROM_RTC),--rtc) 
 N64_ED64ROMCONFIGFLAGS += $(if $(N64_ROM_REGIONFREE),--regionfree)
 N64_ED64ROMCONFIGFLAGS += $(if $(N64_ROM_CONTROLLER1),--controller1 $(N64_ROM_CONTROLLER1))
@@ -268,6 +281,11 @@ $(BUILD_DIR)/%.o: $(SOURCE_DIR)/%.cpp
 		$(N64_DSOMSYM) -e "$$EXTERNS_FILE" "$$INPUT_FILE" $@; \
 	fi
 	
+# If a recipe fails, delete the target it was building. Otherwise a partially
+# written file would be left behind, and the next build would consider it
+# up-to-date and never retry the failed step.
+.DELETE_ON_ERROR:
+
 ifneq ($(V),1)
 .SILENT:
 endif

@@ -27,6 +27,14 @@
 #ifdef __cplusplus
 #include <cassert>
 #endif
+// NOTE: <filesystem> declares std::filesystem::rename() with a 3-argument
+// overload, which cannot be parsed once our own rename() macro (see below) is
+// defined. Include it upfront so that this header can be included anywhere,
+// even before <filesystem> itself. As a consequence, std::filesystem::rename()
+// cannot be called by tools; use the C rename() instead.
+#ifdef __cplusplus
+#include <filesystem>
+#endif
 #include <stdlib.h>
 #include <errno.h>
 #include <stdint.h>
@@ -272,7 +280,7 @@ static void *memmem(const void *l, size_t l_len, const void *s, size_t s_len)
 
 	/* special case where s_len == 1 */
 	if (s_len == 1)
-		return memchr(l, (int)*cs, l_len);
+		return (void*) memchr(l, (int)*cs, l_len);
 
 	/* the last position where its possible to find "s" in "l" */
 	last = (char *)cl + l_len - s_len;

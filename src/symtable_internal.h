@@ -48,6 +48,7 @@ typedef struct {
 
     // Runtime-only fields (not serialized in .sym file)
     uint32_t rom_offset;     ///< ROM offset where this SYMT was loaded from
+    uint32_t addr_base;      ///< Load offset: prog_base for DSOs, 0 for main executable
 } __attribute__((aligned(8))) symtable_header_t;
 
 /** @brief Symbol table entry **/
@@ -75,7 +76,7 @@ extern const char *UNKNOWN_SYMBOL;
  * There could be multiple symbols for the same address, in case of inlined functions.
  * 
  * @param symt          SYMT file header
- * @param addr          Address to search for
+ * @param addr          Runtime address to search for
  * @param entries       Output entry structure array
  * @param max_entries   Size of the output entry array
  * @return Number of entries found (0..max_entries)
@@ -90,7 +91,7 @@ int symt_find_symbol(symtable_header_t *symt, uint32_t addr, symtable_entry_t *e
  * @param addr  Address being looked up (for special cases)
  * @param buf   Destination buffer
  * @param size  Size of the destination buffer
- * @return char*  Fetched string within the destination buffer
+ * @return      Fetched string within the destination buffer
  */
 char* symt_get_func_name(symtable_header_t *symt, symtable_entry_t *entry, uint32_t addr, char *buf, int size);
 
@@ -102,7 +103,7 @@ char* symt_get_func_name(symtable_header_t *symt, symtable_entry_t *entry, uint3
  * @param addr  Address being looked up
  * @param buf   Destination buffer
  * @param size  Size of the destination buffer
- * @return char*  Fetched string within the destination buffer
+ * @return      Fetched string within the destination buffer
  */
 char* symt_get_file_name(symtable_header_t *symt, symtable_entry_t *entry, uint32_t addr, char *buf, int size);
 

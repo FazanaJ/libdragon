@@ -93,6 +93,7 @@
 #ifndef LIBDRAGON_RDPQ_MODE_H
 #define LIBDRAGON_RDPQ_MODE_H
 
+#include "preview.h"
 #include "rdpq.h"
 #include <stdint.h>
 
@@ -387,7 +388,7 @@ void rdpq_set_mode_yuv(bool bilinear);
  * #FILTERS_RESAMPLE_ANTIALIAS_DEDITHER to #display_init.
  * 
  * On the other hand, if you want to make sure that no antialias is performed,
- * disable antialias with `rdpq_mode_antialias(false)` (which is the default
+ * disable antialias with `rdpq_mode_antialias(AA_NONE)` (which is the default
  * for #rdpq_set_mode_standard), and that will make sure that the VI will not
  * do anything to the image, even if #display_init was called with
  * #FILTERS_RESAMPLE_ANTIALIAS or #FILTERS_RESAMPLE_ANTIALIAS_DEDITHER.
@@ -564,8 +565,8 @@ inline void rdpq_mode_combiner(rdpq_combiner_t comb) {
  * use #RDPQ_BLENDER_MULTIPLY_CONST.
  * 
  * #RDPQ_BLENDER_ADDITIVE is mostly broken on RDP, as it doesn't handle correctly
- * overflowing values. Basically, values up to 1.5 are correctly clamped to 1,
- * but values above 1.5 are wrapped back to 0, which makes the mode almost useless.
+ * overflowing values. Basically, values that overflow 1.0 are not clamped but
+ * wrap back to 0, which makes the mode almost useless.
  * 
  * It is possible to also create custom formulas. The blender unit
  * allows for up to two passes. Use #RDPQ_BLENDER to create a one-pass
@@ -767,6 +768,7 @@ inline void rdpq_mode_zoverride(bool enable, float z, int16_t deltaz) {
 
 /**
  * @brief Configure the Z buffering mode
+ * @preview
  * 
  * This function allows to tune the internal Z buffer formula to obtain several
  * different effects. In addition to the standard operating mode (#ZMODE_STANDARD),
@@ -785,6 +787,7 @@ inline void rdpq_mode_zoverride(bool enable, float z, int16_t deltaz) {
  * 
  * @see #rdpq_zmode_t
  */
+LIBDRAGON_PREVIEW_API
 inline void rdpq_mode_zmode(rdpq_zmode_t mode) {
     __rdpq_mode_change_som(SOM_ZMODE_MASK, (uint64_t)mode << SOM_ZMODE_SHIFT);
 }

@@ -8,6 +8,7 @@
 #ifndef LIBDRAGON_RDPQ_TEX_H
 #define LIBDRAGON_RDPQ_TEX_H
 
+#include "preview.h"
 #include "rdpq.h"
 #include <stdint.h>
 
@@ -183,7 +184,7 @@ int rdpq_tex_upload(rdpq_tile_t tile, const surface_t *tex, const rdpq_texparms_
  * @param t0         Top-left Y coordinate of the rectangle to load
  * @param s1         Bottom-right *exclusive* X coordinate of the rectangle
  * @param t1         Bottom-right *exclusive* Y coordinate of the rectangle
- * @return int       Number of bytes used in TMEM for this texture
+ * @return           Number of bytes used in TMEM for this texture
  * 
  * @see #rdpq_tex_upload
  * @see #surface_make_sub
@@ -192,6 +193,7 @@ int rdpq_tex_upload_sub(rdpq_tile_t tile, const surface_t *tex, const rdpq_texpa
 
 /**
  * @brief Check if a surface can be fully uploaded to TMEM
+ * @preview
  *
  * This helper verifies whether a full-surface upload via #rdpq_tex_upload
  * would fit in TMEM for the surface format.
@@ -200,6 +202,7 @@ int rdpq_tex_upload_sub(rdpq_tile_t tile, const surface_t *tex, const rdpq_texpa
  * @return true      The surface fits in TMEM
  * @return false     The surface does not fit in TMEM
  */
+LIBDRAGON_PREVIEW_API
 bool rdpq_tex_can_upload(const surface_t *tex);
 
 /**
@@ -247,7 +250,7 @@ void rdpq_tex_upload_tlut(uint16_t *tlut, int color_idx, int num_colors);
  * @param t0         Top-left Y coordinate of the rectangle to reuse
  * @param s1         Bottom-right *exclusive* X coordinate of the rectangle
  * @param t1         Bottom-right *exclusive* Y coordinate of the rectangle
- * @return int       Number of bytes used in TMEM for this texture (always 0)
+ * @return           Number of bytes used in TMEM for this texture (always 0)
  */
 int rdpq_tex_reuse_sub(rdpq_tile_t tile, const rdpq_texparms_t *parms, int s0, int t0, int s1, int t1);
 
@@ -266,7 +269,7 @@ int rdpq_tex_reuse_sub(rdpq_tile_t tile, const rdpq_texparms_t *parms, int s0, i
  * 
  * @param tile       Tile descriptor that will be initialized with reused texture
  * @param parms      All optional parameters on how to sample reused texture. Refer to #rdpq_texparms_t for more information.
- * @return int       Number of bytes used in TMEM for this texture (always 0)
+ * @return           Number of bytes used in TMEM for this texture (always 0)
  */
 int rdpq_tex_reuse(rdpq_tile_t tile, const rdpq_texparms_t *parms);
 
@@ -334,7 +337,8 @@ typedef struct rdpq_blitparms_s {
     float scale_y;      ///< Vertical scale factor to apply to the surface. This scaling is applied along the Y axis before rotation. If 0, no scaling is performed (the same as 1.0f). If negative, vertical flipping is applied
     float theta;        ///< Counter-clockwise rotation angle in radians
     
-    bool allow_xform;   ///< True if blit should be affected by transforms applied by rdpq_xform
+    LIBDRAGON_PREVIEW_SYM
+    bool allow_xform;   ///< True if blit should be affected by transforms applied by rdpq_xform @preview
     
     // FIXME: replace this with CPU tracking of filtering mode?
     bool filtering;     ///< True if texture filtering is enabled (activates workaround for filtering artifacts when splitting textures in chunks)

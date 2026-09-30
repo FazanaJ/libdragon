@@ -93,8 +93,10 @@ void __lookahead_buf_refill(__lookahead_buf_t *lb)
 
     #ifdef N64
     if (lb->rom_base) {
-        data_cache_hit_invalidate(lb->buf[lb->cur ^ 1], sizeof(lb->buf[0]));
-        dma_read_raw_async(lb->buf[lb->cur ^ 1], lb->rom_addr, sizeof(lb->buf[0]));
+        dma_wait_finished(lb->ticket[lb->cur]);
+        int next = lb->cur ^ 1;
+        data_cache_hit_invalidate(lb->buf[next], sizeof(lb->buf[0]));
+        lb->ticket[next] = dma_read_raw_async(lb->buf[next], lb->rom_addr, sizeof(lb->buf[0]));
         lb->rom_addr += sizeof(lb->buf[0]);
         buf_size = sizeof(lb->buf[0]);
     } else {
@@ -115,7 +117,7 @@ void __lookahead_buf_init(__lookahead_buf_t *lb, int fd)
     lb->fd = fd;
 
     #ifdef N64
-    uint32_t rom_base = 0;
+    pi_addr_t rom_base = 0;
     if (ioctl(fd, IODFS_GET_ROM_BASE, &rom_base) >= 0) {
         lb->rom_base = rom_base;
     }
@@ -135,8 +137,9 @@ void __lookahead_buf_reset(__lookahead_buf_t *lb)
     if (lb->rom_base) {
         // Prefetch the first buffer (the logic expects the first refill() to flip
         // cur and start prefetching the other buffer).
-        data_cache_hit_invalidate(lb->buf[lb->cur ^ 1], sizeof(lb->buf[0]));
-        dma_read_raw_async(lb->buf[lb->cur ^ 1], lb->rom_addr, sizeof(lb->buf[0]));
+        int next = lb->cur ^ 1;
+        data_cache_hit_invalidate(lb->buf[next], sizeof(lb->buf[0]));
+        lb->ticket[next] = dma_read_raw_async(lb->buf[next], lb->rom_addr, sizeof(lb->buf[0]));
         lb->rom_addr += sizeof(lb->buf[0]);
     }
     #endif

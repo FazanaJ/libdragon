@@ -8,6 +8,7 @@
 #ifndef __LIBDRAGON_ASSET_H
 #define __LIBDRAGON_ASSET_H
 
+
 /**
  * @defgroup asset Asset Subsystem
  * @ingroup libdragon
@@ -68,6 +69,7 @@
  */
 
 #include <stdio.h>
+#include "preview.h"
 #include "debug.h"
 
 #ifdef __cplusplus
@@ -124,12 +126,13 @@ extern void __asset_init_compression_lvl3(void);
  * 
  * @param fn        Filename to load (including filesystem prefix, eg: "rom:/foo.dat")
  * @param sz        If not NULL, this will be filed with the uncompressed size of the loaded file
- * @return void*    Pointer to the loaded file (must be freed with free() when done)
+ * @return          Pointer to the loaded file (must be freed with free() when done)
  */
 void *asset_load(const char *fn, int *sz);
 
 /**
  * @brief Load an asset file (possibly uncompressing it)
+ * @preview
  * 
  * This function loads an asset embedded within a larger file. It requires in
  * input an open file pointer, seeked to the beginning of the asset, and the
@@ -149,13 +152,15 @@ void *asset_load(const char *fn, int *sz);
  * @param sz        size of input data (compressed or not). It will be filled
  *                  the uncompressed asset size, which is equal to the input value if the
  *                  asset is not compressed.
- * @return void*    Allocated buffer filled with the uncompressed asset content
+ * @return          Allocated buffer filled with the uncompressed asset content
  */
+LIBDRAGON_PREVIEW_API
 void* asset_loadf(FILE *f, int *sz);
 
 
 /**
   * @brief Load an asset file (possibly uncompressing it)
+  * @preview
   *
   * This is the lowest-level asset loading function, that is
   * needed only for advanced use cases. In general, prefer using
@@ -198,6 +203,7 @@ void* asset_loadf(FILE *f, int *sz);
   *               In this case, *buf_size is changed to contain the minimum size
   *               that is required to load this asset.
   */
+LIBDRAGON_PREVIEW_API
 bool asset_loadf_into(FILE *f, int *sz, void *buf, int *buf_size);
 
 /**
@@ -220,7 +226,7 @@ bool asset_loadf_into(FILE *f, int *sz, void *buf, int *buf_size);
  * 
  * @param fn        Filename to load (including filesystem prefix, eg: "rom:/foo.dat")
  * @param sz        If not NULL, this will be filed with the uncompressed size of the loaded file
- * @return FILE*    FILE pointer to use with standard C functions (fread, fclose)
+ * @return          FILE pointer to use with standard C functions (fread, fclose)
  */
 FILE *asset_fopen(const char *fn, int *sz);
 
