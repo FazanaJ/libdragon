@@ -1,6 +1,8 @@
 BUILD_DIR ?= .
 SOURCE_DIR ?= .
 
+EXT_CFLAGS ?=
+
 # Preview API policy (must be set before including this file):
 #   0 — using a preview API is a compile-time error (default)
 #   1 — preview APIs are usable but produce a compiler warning
@@ -84,7 +86,7 @@ N64_C_AND_CXX_FLAGS += -ffast-math -ftrapping-math -fno-associative-math
 N64_C_AND_CXX_FLAGS += -DN64 -O2 -Wall -Werror -Wno-error=deprecated-declarations -fdiagnostics-color=always
 N64_C_AND_CXX_FLAGS += -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=unused-function -Wno-error=unused-parameter -Wno-error=unused-but-set-parameter -Wno-error=unused-label -Wno-error=unused-local-typedefs -Wno-error=unused-const-variable
 N64_C_AND_CXX_FLAGS += -ftrivial-auto-var-init=pattern
-N64_CFLAGS = $(N64_C_AND_CXX_FLAGS) -std=gnu17
+N64_CFLAGS = $(N64_C_AND_CXX_FLAGS) $(EXT_CFLAGS) -std=gnu17
 N64_CXXFLAGS = $(N64_C_AND_CXX_FLAGS) -std=gnu++17
 N64_ASFLAGS = -mtune=vr4300 -march=vr4300 -mabi=o64 -Wa,--fatal-warnings -I$(N64_INCLUDEDIR)
 N64_RSPASFLAGS = -march=mips1 -mabi=32 -Wa,--fatal-warnings -I$(N64_INCLUDEDIR)
