@@ -5,29 +5,29 @@
  * @brief Display Subsystem
  * @ingroup display
  */
-#include <stdint.h>
-#include <stdbool.h>
-#include <malloc.h>
-#include <string.h>
-#include <math.h>
-#include "regsinternal.h"
-#include "system_internal.h"
-#include "n64sys.h"
 #include "display.h"
-#include "interrupt.h"
-#include "utils.h"
-#include "debug.h"
-#include "surface.h"
-#include "rsp.h"
-#include "kirq.h"
 #include "accounting_internal.h"
+#include "debug.h"
+#include "interrupt.h"
+#include "kirq.h"
+#include "n64sys.h"
+#include "regsinternal.h"
+#include "rsp.h"
+#include "surface.h"
+#include "system_internal.h"
+#include "utils.h"
+#include <malloc.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 
 /** @brief Maximum number of video backbuffers */
-#define NUM_BUFFERS         32
+#define NUM_BUFFERS 32
 /** @brief Number of past frames used to evaluate FPS */
-#define FPS_WINDOW          32
+#define FPS_WINDOW 32
 /** @brief How many times per second we should update the FPS value */
-#define FPS_UPDATE_FREQ      4
+#define FPS_UPDATE_FREQ 4
 
 static surface_t *surfaces;
 /** @brief Currently allocated Z-buffer (allocated for __alloc_width x __alloc_height) */
@@ -54,7 +54,7 @@ static uint32_t __alloc_height = 0;
 static uint32_t __alloc_bitdepth = 0;
 static uint32_t __alloc_buffers = 0;
 /** @brief Stored params for apply_display_vi_config when a display_change() is pending */
-static resolution_t pending_res;
+resolution_t pending_res;
 static bitdepth_t pending_bit;
 static gamma_t pending_gamma;
 static filter_options_t pending_filters;
@@ -98,10 +98,10 @@ static void apply_display_vi_config(resolution_t res, bitdepth_t bit, gamma_t ga
 
 /** @brief State for the Kalman filter */
 typedef struct {
-    float P;            ///< Process noise covariance
-    float Q;            ///< Measurement noise covariance
-    float R;            ///< Estimation error covariance
-    float p_estimate;   ///> Last estimated value
+    float P;          ///< Process noise covariance
+    float Q;          ///< Measurement noise covariance
+    float R;          ///< Estimation error covariance
+    float p_estimate; ///> Last estimated value
 } kalman_state_t;
 
 /** @brief State for kalman filter used for FPS estimation */
@@ -110,8 +110,7 @@ static kalman_state_t k_fps;
 static kalman_state_t k_delta;
 
 /** @brief Initalize Kalman's filter  */
-static void kalman_init(kalman_state_t *s, float x, float Q)
-{
+static void kalman_init(kalman_state_t *s, float x, float Q) {
     s->P = 1.0f;
     s->Q = Q;
     s->R = 1.0f;
@@ -119,8 +118,7 @@ static void kalman_init(kalman_state_t *s, float x, float Q)
 }
 
 /** @brief Run kalman's filter */
-static float kalman(kalman_state_t *s, float x)
-{
+static float kalman(kalman_state_t *s, float x) {
     float p_pred = s->p_estimate;
     float P_pred = s->P + s->Q;
 
@@ -139,15 +137,14 @@ static inline int buffer_next(int idx) {
     return idx;
 }
 
-/** 
- * @brief Check if we should use this vblank interrupt or not, depending on fps limit 
- * 
+/**
+ * @brief Check if we should use this vblank interrupt or not, depending on fps limit
+ *
  * FPS limit is implemented simply by pretending the hardware is slower at generating
  * video interrupts, which in turn means skipping an interrupt every now and then
  * to keep the frame rate within the desired limits.
  */
-static bool fps_limit_ok(void)
-{
+static bool fps_limit_ok(void) {
     static float frame_skip_accum = 0.0f;
     frame_skip_accum += frame_skip;
     if (frame_skip_accum < 0.0f) return false;
@@ -155,18 +152,17 @@ static bool fps_limit_ok(void)
     return true;
 }
 
-/** 
- * @brief Update FPS estimation. 
- * 
+/**
+ * @brief Update FPS estimation.
+ *
  * This function is on every "virtual" vblank (that is, only on vblank interrupts
  * which are not ignored by #fps_limit_ok). It updates the estimation of the
  * frame rate using a Kalman filter, based on the number of frames that were
  * actually displayed.
- * 
+ *
  * @param newframe      True if a new frame was displayed in this vblank, false otherwise
  */
-static void update_fps(bool newframe)
-{
+static void update_fps(bool newframe) {
     static int last_frame_counter = 0;
     ++last_frame_counter;
     if (!newframe) return;
@@ -181,11 +177,11 @@ static void update_fps(bool newframe)
     static uint32_t last_update = 0;
     uint32_t now = TICKS_READ();
     if (TICKS_DISTANCE(last_update, now) > TICKS_PER_SECOND / FPS_UPDATE_FREQ) {
-        last_update = now;        
+        last_update = now;
         frame_rate_snapshot = 1.0f / (kk_fps * min_refresh_period_rounded);
         // Update the refresh rate in case it changed (eg: switch PAL50/PAL60)
         refresh_rate = vi_get_refresh_rate();
-        refresh_period = 1.0f / refresh_rate;    
+        refresh_period = 1.0f / refresh_rate;
         display_set_fps_limit(fps_limit);
     }
 
@@ -197,12 +193,11 @@ static void update_fps(bool newframe)
  *
  * If there is another frame to display, display the frame
  */
-static void __display_callback(void *arg)
-{
+static void __display_callback(void *arg) {
     // If a reset has occured and this is almost the last VI interrupt
     // before RESET_TIME_LENGTH grace period, stop all work and exit
-    uint32_t next_time = TICKS_FROM_MS(refresh_period*1000);
-    if(exception_reset_time() + next_time*3 >= RESET_TIME_LENGTH) die();
+    uint32_t next_time = TICKS_FROM_MS(refresh_period * 1000);
+    if (exception_reset_time() + next_time * 3 >= RESET_TIME_LENGTH) die();
 
     /* Least significant bit of the current line register indicates
        if the currently displayed field is odd or even. */
@@ -241,7 +236,7 @@ static void __display_callback(void *arg)
         apply_display_vi_config(pending_res, pending_bit, pending_gamma, pending_filters);
     }
     vi_show(&surfaces[now_showing]);
-    if ( vi_bug_workaround ) vi_write(VI_X_SCALE, 0x201);
+    if (vi_bug_workaround) vi_write(VI_X_SCALE, 0x201);
     vi_write_end();
 }
 
@@ -249,19 +244,17 @@ static void __display_callback(void *arg)
  * @brief Apply VI configuration (interlace, gamma, filters, borders, vi_bug_workaround).
  * Caller must hold vi_write_begin() / vi_write_end() around this.
  */
-static void apply_display_vi_config(resolution_t res, bitdepth_t bit, gamma_t gamma, filter_options_t filters)
-{
+static void apply_display_vi_config(resolution_t res, bitdepth_t bit, gamma_t gamma, filter_options_t filters) {
     vi_set_interlaced(res.interlaced != INTERLACE_OFF);
     vi_set_gamma((vi_gamma_t)gamma);
 
-    switch (filters)
-    {
-        /* Libdragon uses preconfigured modes for enabling certain
-           combinations of VI filters due to a large number of wrong/invalid configurations
-           with very strict conditions, and to simplify the options for the user.
-           Like for example antialiasing requiring resampling; dedithering not working with
-           resampling, unless always fetching; always enabling divot filter under AA etc.
-           The cases below provide all possible configurations that are deemed useful. */
+    switch (filters) {
+            /* Libdragon uses preconfigured modes for enabling certain
+               combinations of VI filters due to a large number of wrong/invalid configurations
+               with very strict conditions, and to simplify the options for the user.
+               Like for example antialiasing requiring resampling; dedithering not working with
+               resampling, unless always fetching; always enabling divot filter under AA etc.
+               The cases below provide all possible configurations that are deemed useful. */
 
         case FILTERS_DISABLED:
             /* Disabling resampling (AA_MODE = 0x3) on 16bpp hits a hardware bug on NTSC
@@ -278,8 +271,8 @@ static void apply_display_vi_config(resolution_t res, bitdepth_t bit, gamma_t ga
                with FILTERS_RESAMPLE, and then call vi_set_aa_mode(VI_AA_MODE_NONE); */
             if (bit == DEPTH_16_BPP) {
                 assertf(res.width >= 320,
-                    "FILTERS_DISABLED is not supported by the hardware for widths <= 320.\n"
-                    "Please use FILTERS_RESAMPLE instead.");
+                        "FILTERS_DISABLED is not supported by the hardware for widths <= 320.\n"
+                        "Please use FILTERS_RESAMPLE instead.");
             }
             vi_set_aa_mode(VI_AA_MODE_NONE);
             vi_set_divot(false);
@@ -300,8 +293,8 @@ static void apply_display_vi_config(resolution_t res, bitdepth_t bit, gamma_t ga
             if (bit == DEPTH_16_BPP) {
                 /* Assert on width (see FILTERS_DISABLED) */
                 assertf(res.width > 320,
-                    "FILTERS_DEDITHER is not supported by the hardware for widths <= 320.\n"
-                    "Please use FILTERS_RESAMPLE instead.");
+                        "FILTERS_DEDITHER is not supported by the hardware for widths <= 320.\n"
+                        "Please use FILTERS_RESAMPLE instead.");
                 vi_set_aa_mode(VI_AA_MODE_NONE);
                 vi_set_divot(false);
                 vi_set_dedither(true);
@@ -309,7 +302,7 @@ static void apply_display_vi_config(resolution_t res, bitdepth_t bit, gamma_t ga
                 vi_set_aa_mode(VI_AA_MODE_NONE);
                 vi_set_divot(false);
                 vi_set_dedither(false);
-                }
+            }
             break;
         case FILTERS_RESAMPLE_ANTIALIAS:
             /* Set AA on resample and fetch as well as divot on.
@@ -351,8 +344,7 @@ static void apply_display_vi_config(resolution_t res, bitdepth_t bit, gamma_t ga
     vi_bug_workaround = (res.width == 320 && bit == DEPTH_16_BPP && filters == FILTERS_DISABLED);
 }
 
-void display_init( resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamma_t gamma, filter_options_t filters )
-{
+void display_init(resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamma_t gamma, filter_options_t filters) {
     assertf(__num_buffers == 0, "display_init() called while the display is already initialized.\nPlease close the current display with display_close() first.");
 
     /* Calculate width and scale registers */
@@ -401,8 +393,7 @@ void display_init( resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamma
 
     /* Initialize buffers and set parameters */
     tex_format_t format = bit == DEPTH_16_BPP ? FMT_RGBA16 : FMT_RGBA32;
-    for (int i = 0; i < __num_buffers; i++)
-    {
+    for (int i = 0; i < __num_buffers; i++) {
         /* Set parameters necessary for drawing */
         /* Grab a location to render to */
         surfaces[i] = surface_alloc(format, __width, __height);
@@ -445,8 +436,7 @@ void display_init( resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamma
     handler_installed = true;
 }
 
-void display_change(resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamma_t gamma, filter_options_t filters)
-{
+void display_change(resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamma_t gamma, filter_options_t filters) {
     assertf(__alloc_buffers != 0, "display_change() called with display not initialized.");
 
     assertf(res.width > 0, "nonpositive width");
@@ -459,14 +449,14 @@ void display_change(resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamm
         assertf(res.width % 2 == 0, "width must be divisible by 2 for 32-bit depth");
 
     assertf(num_buffers <= __alloc_buffers,
-        "display_change() num_buffers (%u) exceeds originally allocated (%u).", (unsigned)num_buffers, (unsigned)__alloc_buffers);
+            "display_change() num_buffers (%u) exceeds originally allocated (%u).", (unsigned)num_buffers, (unsigned)__alloc_buffers);
 
     uint32_t new_bpp = (bit == DEPTH_16_BPP) ? 2 : 4;
     uint32_t new_size = (uint32_t)res.width * (uint32_t)res.height * new_bpp;
     uint32_t alloc_size = __alloc_width * __alloc_height * __alloc_bitdepth;
     assertf(new_size <= alloc_size,
-        "display_change() framebuffer size (%ux%u %s) exceeds allocated size.", (unsigned)res.width, (unsigned)res.height,
-        bit == DEPTH_16_BPP ? "16bpp" : "32bpp");
+            "display_change() framebuffer size (%ux%u %s) exceeds allocated size.", (unsigned)res.width, (unsigned)res.height,
+            bit == DEPTH_16_BPP ? "16bpp" : "32bpp");
 
     uint32_t nb = MAX(1, MIN(NUM_BUFFERS, num_buffers));
 
@@ -486,16 +476,14 @@ void display_change(resolution_t res, bitdepth_t bit, uint32_t num_buffers, gamm
     enable_interrupts();
 }
 
-void display_close()
-{
+void display_close() {
     // Contrary to most other subsystems, for display we want to handle
     // correctly failed display_init() calls followed by
     // display_close(), because this is a common pattern during eg
     // exception handling. So we need to be a bit more careful than usual
     // to make sure to deinitialize piece-wise.
 
-    if ( handler_installed )
-    {
+    if (handler_installed) {
         vi_uninstall_vblank_handler(__display_callback, NULL);
         handler_installed = false;
     }
@@ -508,8 +496,7 @@ void display_close()
     display_queue_count = 0;
     pending_vi_frames_left = -1;
 
-    if (surf_zbuf.buffer)
-    {
+    if (surf_zbuf.buffer) {
         surface_free(&surf_zbuf);
         memset(&surf_zbuf_view, 0, sizeof(surf_zbuf_view));
         if (zbuf_sbrk_top) {
@@ -523,10 +510,8 @@ void display_close()
     vi_show(NULL);
     vi_wait_vblank();
 
-    if (surfaces)
-    {
-        for (uint32_t i = 0; i < __alloc_buffers; i++)
-        {
+    if (surfaces) {
+        for (uint32_t i = 0; i < __alloc_buffers; i++) {
             /* Free framebuffer memory */
             surface_free(&surfaces[i]);
         }
@@ -543,9 +528,8 @@ void display_close()
     __alloc_buffers = 0;
 }
 
-surface_t* display_try_get(void)
-{
-    surface_t* retval = NULL;
+surface_t *display_try_get(void) {
+    surface_t *retval = NULL;
     int next, start;
 
     assertf(__num_buffers != 0, "Display not initialized.");
@@ -589,34 +573,33 @@ surface_t* display_try_get(void)
     return retval;
 }
 
-surface_t* display_get(void)
-{
+surface_t *display_get(void) {
     // Wait until a buffer is available. We use a RSP_WAIT_LOOP as
     // it is common for display to become ready again after RSP+RDP
     // have finished processing the previous frame's commands.
-    surface_t* disp;
+    surface_t *disp;
 
     assertf(__num_buffers != 0, "Display not initialized.");
 
     kirq_wait_t kirq = kirq_begin_wait_vi();
-    ACCT_SCOPE(ACCT_CAT_DISPLAY) RSP_WAIT_LOOP(200) {
-         if ((disp = display_try_get())) {
-             break;
-         }
-         kirq_wait(&kirq);
+    ACCT_SCOPE(ACCT_CAT_DISPLAY)
+    RSP_WAIT_LOOP(200) {
+        if ((disp = display_try_get())) {
+            break;
+        }
+        kirq_wait(&kirq);
     }
     return disp;
 }
 
-surface_t* display_get_zbuf(void)
-{
+surface_t *display_get_zbuf(void) {
     if (surf_zbuf.buffer == NULL) {
         /* Try to allocate the Z-Buffer from the top of the heap (near the stack).
            This basically puts it in the last memory bank, hopefully separating it
            from framebuffers, which provides a nice speed gain. */
         uint32_t alloc_size = __alloc_width * __alloc_height * 2;
         void *buf = sbrk_top(alloc_size);
-        if (buf != (void*)-1) {
+        if (buf != (void *)-1) {
             data_cache_hit_invalidate(buf, alloc_size);
             surf_zbuf = surface_make(UncachedAddr(buf), FMT_RGBA16, (uint16_t)__alloc_width, (uint16_t)__alloc_height, (uint16_t)(__alloc_width * 2));
             zbuf_sbrk_top = true;
@@ -629,8 +612,7 @@ surface_t* display_get_zbuf(void)
     return &surf_zbuf_view;
 }
 
-void display_show( surface_t* surf )
-{
+void display_show(surface_t *surf) {
     /* They tried drawing on a bad context */
     if (surf == NULL)
         return;
@@ -655,43 +637,27 @@ void display_show( surface_t* surf )
     enable_interrupts();
 }
 
-uint32_t display_get_width(void)
-{
-    return pending_res.width;
-}
-
-uint32_t display_get_height(void)
-{
-    return pending_res.height;
-}
-
-uint32_t display_get_bitdepth(void)
-{
+uint32_t display_get_bitdepth(void) {
     return pending_bit == DEPTH_16_BPP ? 2 : 4;
 }
 
-uint32_t display_get_num_buffers(void)
-{
+uint32_t display_get_num_buffers(void) {
     return (uint32_t)__num_buffers;
 }
 
-float display_get_fps(void)
-{
+float display_get_fps(void) {
     return frame_rate_snapshot;
 }
 
-float display_get_refresh_rate(void)
-{
+float display_get_refresh_rate(void) {
     return refresh_rate;
 }
 
-float display_get_delta_time(void)
-{
+float display_get_delta_time(void) {
     return delta_time;
 }
 
-void display_set_fps_limit(float fps)
-{
+void display_set_fps_limit(float fps) {
     assert(fps >= 0.0f);
 
     disable_interrupts();
@@ -710,10 +676,9 @@ void display_set_fps_limit(float fps)
     enable_interrupts();
 }
 
-surface_t display_get_current_framebuffer(void)
-{
+surface_t display_get_current_framebuffer(void) {
     return surface_make_linear(
-        VirtualUncachedAddr(*VI_ORIGIN), 
+        VirtualUncachedAddr(*VI_ORIGIN),
         display_get_bitdepth() == 2 ? FMT_RGBA16 : FMT_RGBA32,
         display_get_width(),
         display_get_height());
