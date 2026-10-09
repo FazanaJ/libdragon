@@ -75,7 +75,6 @@ LIBDRAGON_OBJS += \
 	$(BUILD_DIR)/rsp_crash.o \
 	$(BUILD_DIR)/inspector.o \
 	$(BUILD_DIR)/sprite.o \
-	$(BUILD_DIR)/lspr3.o \
 	$(BUILD_DIR)/lspr1.o \
 	$(BUILD_DIR)/rsp_lspr1.o \
 	$(BUILD_DIR)/dma.o \
@@ -98,11 +97,8 @@ include $(SOURCE_DIR)/audio/libdragon.mk
 include $(SOURCE_DIR)/bb/libdragon.mk
 include $(SOURCE_DIR)/dd/libdragon.mk
 include $(SOURCE_DIR)/joybus/libdragon.mk
-include $(SOURCE_DIR)/GL/libdragon.mk
-include $(SOURCE_DIR)/video/libdragon.mk
 include $(SOURCE_DIR)/rspq/libdragon.mk
 include $(SOURCE_DIR)/rdpq/libdragon.mk
-include $(SOURCE_DIR)/magma/libdragon.mk
 include $(SOURCE_DIR)/math/libdragon.mk
 include $(SOURCE_DIR)/compress/libdragon.mk
 

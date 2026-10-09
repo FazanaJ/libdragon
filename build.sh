@@ -72,7 +72,6 @@ if [ "$BUILD_EXAMPLES" = true ]; then
   # so first clobber the build to make sure that everything works against the
   # installed version rather than using local artifacts.
   makeWithParams clobber
-  makeWithParams examples
 fi
 
 echo

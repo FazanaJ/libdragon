@@ -114,14 +114,12 @@ $(DECOMP_STUBS):
 mkasset_OBJS = mkasset/mkasset.o common/assetcomp.a
 mksprite_OBJS = mksprite/mksprite.o mksprite/mksprite_h264i.o mksprite/mksprite_bc1q.o mksprite/x264_amalgam.o mksprite/x264_amalgam2.o common/assetcomp.a
 mkfont_OBJS = mkfont/mkfont.o mkfont/freetype/FreeTypeAmalgam.o mkfont/plutosvg/plutosvg-amalgam.o common/assetcomp.a
-mkmodel_OBJS = mkmodel/mkmodel.o common/assetcomp.a
 mkmaterial_OBJS = mkmaterial/mkmaterial.o mkmaterial/mkmaterial_parse.o mkmaterial/mkmaterial_export.o common/assetcomp.a 
 combexpr_OBJS = mkmaterial/combexpr_cli.o mkmaterial/combexpr_disasm.o
 n64dso_OBJS = n64dso/n64dso.o common/assetcomp.a
 n64dso-extern_OBJS = n64dso/n64dso-extern.o
 n64dso-msym_OBJS = n64dso/n64dso-msym.o
 audioconv64_OBJS = audioconv64/audioconv64.o audioconv64/conv_wav64.o audioconv64/conv_xm64.o audioconv64/conv_ym64.o audioconv64/conv_sf64.o audioconv64/conv_mid64.o audioconv64/libvadpcm.o audioconv64/libopus.o audioconv64/libsamplerate.o audioconv64/liblzh5.o audioconv64/libxm.o audioconv64/libulc.o common/binout.o common/assetcomp.a
-videoconv64_OBJS = videoconv64/videoconv64.o videoconv64/vconv_analyze.o videoconv64/vconv_encode.o videoconv64/vconv_encode_mpeg1.o videoconv64/vconv_encode_h264.o videoconv64/vconv_audio.o videoconv64/vconv_subtitles.o videoconv64/vconv_utils.o videoconv64/vconv_seek.o common/binout.o common/assetcomp.a
 rdpvalidate_OBJS = rdpvalidate/rdpvalidate.o
 mkdfs_OBJS = mkdfs/mkdfs.o
 dumpdfs_OBJS = dumpdfs/dumpdfs.o
@@ -133,7 +131,7 @@ n64metadata_OBJS = n64metadata.o
 ed64romconfig_OBJS = ed64romconfig.o
 n64elfcompress_OBJS = n64elfcompress/n64elfcompress.o common/assetcomp.a
 n64elfcompress/n64elfcompress.o: n64elfcompress/n64elfcompress.c $(DECOMP_STUBS)
-TOOLS = n64tool n64metadata n64sym n64symdump n64elfcompress ed64romconfig audioconv64 videoconv64 mkdfs dumpdfs mkasset mksprite mkfont mkmodel mkmaterial n64dso n64dso-msym n64dso-extern rdpvalidate combexpr cpaktool
+TOOLS = n64tool n64metadata n64sym n64symdump n64elfcompress ed64romconfig audioconv64 mkdfs dumpdfs mkasset mksprite mkfont mkmaterial n64dso n64dso-msym n64dso-extern rdpvalidate combexpr cpaktool
 
 ifeq ($(OS),Windows_NT)
 MANIFEST = $(if $(findstring Windows,$(OS)),manifest.o,)
