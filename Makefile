@@ -230,9 +230,9 @@ test:
 test-clean: $(INSTALLDIR)/include/n64.mk
 	$(MAKE) -C tests clean
 
-clobber: clean examples-clean tools-clean test-clean
+clobber: clean tools-clean
 
-.PHONY : clobber clean doxygen-api examples examples-clean tools tools-clean tools-install test test-clean install-mk libdragon gen-version
+.PHONY : clobber clean doxygen-api tools tools-clean tools-install install-mk libdragon gen-version
 
 # Automatic dependency tracking
 -include $(wildcard $(BUILD_DIR)/*.d) $(wildcard $(BUILD_DIR)/*/*.d)
