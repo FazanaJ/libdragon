@@ -680,6 +680,7 @@ void __rdpq_block_begin()
     // reflects the post-state of the block, at __rdpq_block_end we capture it
     // onto the block and restore this saved copy.
     rdpq_block_state.previous_mirror = rdpq_state_mirror;
+    rdpq_block_state.previous_frozen_dmem_pending = __rdpq_frozen_dmem_pending;
 
     rdpq_block_state.frozen = (rdpq_config & RDPQ_CFG_FROZEN_BLOCKS) != 0;
 
@@ -707,6 +708,7 @@ void __rdpq_block_recycle(rdpq_block_t *head)
     memset(st, 0, sizeof(*st));
     st->previous_tracking = rdpq_tracking;
     st->previous_mirror = rdpq_state_mirror;
+    st->previous_frozen_dmem_pending = __rdpq_frozen_dmem_pending;
     st->frozen = (rdpq_config & RDPQ_CFG_FROZEN_BLOCKS) != 0;
     __rdpq_frozen_mode_pending = false;
     __rdpq_frozen_dmem_pending = 0;
@@ -825,11 +827,6 @@ rdpq_block_t* __rdpq_block_end()
     struct rdpq_block_state_s *st = &rdpq_block_state;
     rdpq_block_t *ret = st->first_node;
 
-    // stop coalescing modes in frozen blocks and flush snything pending out
-    if (st->frozen) {
-        __rdpq_frozen_flush_pending_mode();
-    }
-
     // Save the current autosync state in the first node of the RDP block.
     // This makes it easy to recover it when the block is run
     if (st->first_node) {
@@ -837,6 +834,7 @@ rdpq_block_t* __rdpq_block_end()
         // Capture the CPU mirror as the block's post-state. When the block is
         // later run, the live mirror is updated to this value.
         st->first_node->mirror_post = rdpq_state_mirror;
+        st->first_node->mirror_written = st->mirror_written;
         // For frozen blocks, persist the pre-state snapshot (taken at begin,
         // saved in previous_mirror) so playback can compare against it.
         st->first_node->frozen = st->frozen;
@@ -847,6 +845,7 @@ rdpq_block_t* __rdpq_block_end()
     // Recover tracking state before the block creation started
     rdpq_tracking = st->previous_tracking;
     rdpq_state_mirror = st->previous_mirror;
+    __rdpq_frozen_dmem_pending = st->previous_frozen_dmem_pending;
 
     // Clear the frozen flag now that recording is over. 
     // Without this, the next rdpq mode call outside any block recording would take the frozen-emit path.
@@ -887,10 +886,36 @@ void __rdpq_block_run_with_rdp(rdpq_block_t *block)
       rdpq_tracking.cycle_type_frozen = prev.cycle_type_frozen;
 
   if (block->frozen) {
-    rdpq_state_mirror = block->mirror_post;
-    // Raw RDP commands were committed without the RSP knowing about it,
-    // mark DMEM render state pending so it is lazily re-published when next read.
-    __rdpq_frozen_dmem_pending = RDPQ_WRITE_READS_RDP_STATE;
+    const rdpq_state_mirror_t *post = &block->mirror_post;
+    unsigned int written = block->mirror_written;
+    if (written & RDPQ_MIRROR_MODE) {
+      rdpq_state_mirror.som = post->som;
+      rdpq_state_mirror.cc = post->cc;
+      rdpq_state_mirror.cc_mipmask = post->cc_mipmask;
+      rdpq_state_mirror.blender_steps[0] = post->blender_steps[0];
+      rdpq_state_mirror.blender_steps[1] = post->blender_steps[1];
+    }
+    if (written & RDPQ_MIRROR_SCISSOR) rdpq_state_mirror.scissor = post->scissor;
+    if (written & RDPQ_MIRROR_FILL) rdpq_state_mirror.fill_color = post->fill_color;
+    if (written & RDPQ_MIRROR_PRIM) {
+      rdpq_state_mirror.prim_color_ex = post->prim_color_ex;
+      rdpq_state_mirror.prim_color_rgba = post->prim_color_rgba;
+    }
+    if (written & RDPQ_MIRROR_TARGET) rdpq_state_mirror.target_bitdepth = post->target_bitdepth;
+    if (written & RDPQ_MIRROR_TMEM) {
+      rdpq_state_mirror.autotmem_addr = post->autotmem_addr;
+      rdpq_state_mirror.autotmem_addr_prev = post->autotmem_addr_prev;
+      rdpq_state_mirror.autotmem_enabled = post->autotmem_enabled;
+      rdpq_state_mirror.autotmem_limit_lo = post->autotmem_limit_lo;
+    }
+    rdpq_block_state.mirror_written |= written;
+    // Only state written by this block can make DMEM stale
+    if (written & RDPQ_MIRROR_MODE)
+      __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_OTHER_MODES | RDPQ_WRITE_READS_COMBINER | RDPQ_WRITE_READS_BLENDER;
+    if (written & RDPQ_MIRROR_SCISSOR)
+      __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_SCISSOR;
+    if (written & RDPQ_MIRROR_FILL)
+      __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_COLORS;
   }
 
   // The called block has switched static buffer. Adjust our state to set
@@ -967,6 +992,9 @@ void __rdpq_block_reserve(int num_rdp_commands)
     struct rdpq_block_state_s *st = &rdpq_block_state;
 
     if (num_rdp_commands < 0 || num_rdp_commands >= RDPQ_BLOCK_MIN_SIZE/2/2) {
+        // Geometry-only blocks need an RDP node to track their buffer switch at playback.
+        if (!st->first_node)
+            __rdpq_block_next_buffer();
         // Check if there is a RDP static buffer currently active
         if (st->wptr) {
             // We are about to force RDP switch to dynamic buffer. Save the
@@ -1021,14 +1049,6 @@ void __rdpq_block_update(volatile uint32_t *wptr)
     uint32_t phys_new = PhysicalAddr(wptr);
     st->wptr = wptr;
 
-    // Frozen blocks: an RDP command was just written to the static buffer,
-    // bypassing the RSP-side resolver. DMEM rdpq state is now stale; mark all
-    // groups pending so the next RDPQ_WRITE_READS_* command flushes the ones it
-    // reads. (Coarse: a single passthrough may have touched only one group, but
-    // re-publishing an unchanged group is harmless and keeps this hot path cheap.)
-    if (st->frozen)
-        __rdpq_frozen_dmem_pending = RDPQ_WRITE_READS_RDP_STATE;
-
     assertf((phys_old & 0x7) == 0, "old not aligned to 8 bytes: %lx", phys_old);
     assertf((phys_new & 0x7) == 0, "new not aligned to 8 bytes: %lx", phys_new);
 
@@ -1066,6 +1086,11 @@ void __rdpq_block_update(volatile uint32_t *wptr)
 __attribute__((noinline))
 void __rdpq_write8(uint32_t cmd_id, uint32_t arg0, uint32_t arg1)
 {
+    if (cmd_id == RDPQ_CMD_SET_PRIM_COLOR) {
+        rdpq_state_mirror.prim_color_ex = arg0;
+        rdpq_state_mirror.prim_color_rgba = arg1;
+        rdpq_block_state.mirror_written |= RDPQ_MIRROR_PRIM;
+    }
     rdpq_passthrough_write((cmd_id, arg0, arg1));
 }
 
@@ -1135,6 +1160,7 @@ void __rdpq_fixup_write8_syncchange(uint32_t cmd_id, uint32_t w0, uint32_t w1, u
     // 2=minlod), and emits a raw SET_PRIM_COLOR (opcode 0xFA). We replicate
     // that logic on CPU using the mirror.
     if (cmd_id == RDPQ_CMD_SET_PRIM_COLOR_COMPONENT) {
+        rdpq_block_state.mirror_written |= RDPQ_MIRROR_PRIM;
         uint32_t sel = (w0 >> 16) & 0x3;
         uint32_t prev = (uint32_t)rdpq_state_mirror.prim_color_ex;
         uint32_t merged;
@@ -1175,6 +1201,7 @@ void __rdpq_fixup_write8_syncchange(uint32_t cmd_id, uint32_t w0, uint32_t w1, u
         if (fmt5 == ((0<<2)|3) || fmt5 == ((1<<2)|2) ||
             fmt5 == ((2<<2)|0) || fmt5 == ((2<<2)|1)) {
             rdpq_state_mirror.autotmem_limit_lo = 1;
+            rdpq_block_state.mirror_written |= RDPQ_MIRROR_TMEM;
         }
 
         if (rdpq_block_state.frozen) {
@@ -1209,10 +1236,12 @@ void __rdpq_set_scissor(uint32_t w0, uint32_t w1)
     // we track the cycle type, because the RSP must always know the current
     // scissoring rectangle. So we must always go through the fixup.
     rdpq_state_mirror.scissor = ((uint64_t)w0 << 32) | (uint64_t)w1;
+    rdpq_block_state.mirror_written |= RDPQ_MIRROR_SCISSOR;
 
     if (rdpq_block_state.frozen) {
         // CPU port of RDPQ_WriteSetScissor (rsp_rdpq.inc:719): in FILL/COPY
         // mode the right edge is subtracted by 1 subpixel before emitting.
+        __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_SCISSOR;
         uint32_t sc_lo = w1;
         if ((rdpq_state_mirror.som & SOM_CYCLE_MASK) >= SOM_CYCLE_COPY)
             sc_lo -= (1u << 12);
@@ -1240,9 +1269,11 @@ void __rdpq_set_fill_color(uint32_t w1)
 {
     __rdpq_autosync_change(AUTOSYNC_PIPE);
     rdpq_state_mirror.fill_color = w1;
+    rdpq_block_state.mirror_written |= RDPQ_MIRROR_FILL;
 
     if (rdpq_block_state.frozen) {
         // CPU port: bitdepth 3 (32bpp) sends raw, otherwise pack to RGBA5551 x2.
+        __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_COLORS;
         uint32_t emit_val = ((rdpq_state_mirror.target_bitdepth & 3) == 3)
             ? w1
             : __rdpq_fill_pack_rgba5551(w1);
@@ -1260,12 +1291,14 @@ void __rdpq_set_color_image(uint32_t w0, uint32_t w1, uint32_t sw0, uint32_t sw1
     __rdpq_autosync_change(AUTOSYNC_PIPE);
     // Bitdepth (2-bit format size code) lives at bits [20:19] of w0.
     rdpq_state_mirror.target_bitdepth = (w0 >> 19) & 0x3;
+    rdpq_block_state.mirror_written |= RDPQ_MIRROR_TARGET | RDPQ_MIRROR_FILL;
 
     // RDPQCmd_SetColorImage (rsp_rdpq.S:368) does: save bitdepth, fixup the
     // lookup-table address (same RDPQ_FixupAddress as SetFixupImage), emit raw
     // SET_COLOR_IMAGE, then re-emit fill color repacked for the new bitdepth
     // (via RDPQ_WriteSetFillColor). In frozen mode we replicate this on CPU.
     if (rdpq_block_state.frozen) {
+        __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_COLORS;
         // Placeholder surfaces (non-zero lookup index) are forbidden in frozen
         // blocks — the address-table lives in DMEM and can't be resolved at
         // record time. Use a block placeholder instead.
@@ -1550,6 +1583,7 @@ void rdpq_set_tile_autotmem(int16_t tmem_bytes)
     }
 
     __rdpq_mirror_autotmem_setaddr(tmem_bytes);
+    rdpq_block_state.mirror_written |= RDPQ_MIRROR_TMEM;
 
     // Frozen recording: the CPU mirror is the source of truth for autotmem
     // allocation, the RSP-side state is not consulted because we'll CPU-resolve

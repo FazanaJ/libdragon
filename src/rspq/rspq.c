@@ -1402,11 +1402,8 @@ rspq_block_t* rspq_block_end(void)
 {
     assertf(rspq_block, "a block was not being created");
 
-    // Frozen blocks: do NOT eagerly publish the post-state to DMEM here.
-    // The DMEM staleness left by the block is republished lazily at run time, 
-    // by the first rdpq command after the block that reads RDP state.
-    // Any pending state accumulated while recording is either already baked or re-established at block run.
-    __rdpq_frozen_dmem_pending = 0;
+    // Flush deferred modes before RET, while writes still go into the block.
+    __rdpq_frozen_flush_pending_mode();
 
     // Terminate the block with a RET command, encoding
     // the nesting level which is used as stack slot by RSP.
@@ -1415,8 +1412,6 @@ rspq_block_t* rspq_block_end(void)
     // Switch back to the normal display list
     rspq_switch_context(&lowpri);
 
-    // __rdpq_block_end may allocate RDP buffers. Temporarily clear rspq_block
-    // so that rspq_next_buffer takes the main-queue path on overflow.
     rspq_block_t *b = rspq_block;
     rspq_block = NULL;
 
@@ -1468,6 +1463,7 @@ void rspq_block_run(rspq_block_t *block)
     // in-use if highpri preempted lowpri exactly during a buffer swap, so make
     // sure to avoid using it.
     assertf(rspq_ctx != &highpri, "block run is not supported in highpri mode");
+    __rdpq_frozen_flush_pending_mode();
 
     if((uint32_t)block < RSPQ_BLOCK_PLACEHOLDER_COUNT)
     {

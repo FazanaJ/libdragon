@@ -99,6 +99,15 @@ typedef struct {
 
 extern rdpq_state_mirror_t rdpq_state_mirror;
 
+enum {
+    RDPQ_MIRROR_MODE = 1 << 0,
+    RDPQ_MIRROR_SCISSOR = 1 << 1,
+    RDPQ_MIRROR_FILL = 1 << 2,
+    RDPQ_MIRROR_PRIM = 1 << 3,
+    RDPQ_MIRROR_TARGET = 1 << 4,
+    RDPQ_MIRROR_TMEM = 1 << 5,
+};
+
 /**
  * @brief A buffer that piggybacks onto rspq_block_t to store RDP commands
  *
@@ -115,6 +124,7 @@ typedef struct rdpq_block_s {
     rdpq_state_mirror_t mirror_post;              ///< CPU mirror of RDP state at end of block (populated only on the first link)
     rdpq_state_mirror_t mirror_pre;               ///< CPU mirror snapshot at block-begin (only meaningful when @c frozen is set)
     bool frozen;                                  ///< True if recorded under #RDPQ_CFG_FROZEN_BLOCKS (eligible for staleness checks)
+    uint8_t mirror_written;                       ///< Mirror fields written by this block, including nested calls
     uint32_t cmds[] __attribute__((aligned(8)));  ///< RDP commands
 } rdpq_block_t;
 
@@ -157,6 +167,8 @@ typedef struct rdpq_block_state_s {
      * not leak in-block state changes to the surrounding scope.
      */
     rdpq_state_mirror_t previous_mirror;
+    /** @brief Pending DMEM updates in the surrounding queue before recording. */
+    uint16_t previous_frozen_dmem_pending;
     /**
      * @brief True if the current recording session is a frozen block.
      *
@@ -166,6 +178,7 @@ typedef struct rdpq_block_state_s {
      * staleness checks at playback time.
      */
     bool frozen;
+    uint8_t mirror_written;
 } rdpq_block_state_t;
 
 extern rdpq_block_state_t rdpq_block_state;
@@ -173,9 +186,8 @@ extern rdpq_block_state_t rdpq_block_state;
 /**
  * @brief Frozen blocks: global bitmask of RDP state groups stale in DMEM.
  *
- * Set (to all RDPQ_WRITE_READS_* groups) whenever a frozen-block RDP command
- * is written to the static buffer (mode change, scissor, fill, texture,
- * etc.), marking that DMEM no longer reflects the RDP render state. A
+ * State writers mark only the RDPQ_WRITE_READS_* groups they change.
+ * Texture uploads and geometry leave this mask untouched. A
  * RDPQ_WRITE_READS_* command flushes the groups it requests (via
  * #__rdpq_frozen_sync_dmem) and clears those bits, so repeated reads of the
  * same group (e.g. per-triangle) are cheap.
@@ -228,10 +240,11 @@ inline void __rdpq_tracking_state_reset(rdpq_tracking_t *state) {
 inline void __rdpq_autosync_use(uint32_t res)
 {
     rdpq_tracking.autosync |= res;
-    // Frozen-block mode coalescing: a pipe-using command (draw) is about to be written, 
-    // so flush any deferred resolved mode into the static RDP buffer first.
-    if (__builtin_expect((res & AUTOSYNC_PIPE) && __rdpq_frozen_mode_pending, 0)) {
+    // Frozen draws use the recording's mode even when no mode command precedes
+    // them. Block boundaries clear tracking, but the CPU mirror is retained.
+    if (__builtin_expect((res & AUTOSYNC_PIPE) && rdpq_block_state.frozen, 0)) {
         __rdpq_frozen_flush_pending_mode();
+        rdpq_tracking.cycle_type_known = (rdpq_state_mirror.som & SOM_CYCLE_COPY) ? 2 : 1;
     }
 }
 

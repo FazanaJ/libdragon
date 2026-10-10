@@ -196,7 +196,10 @@ __rdpq_resolved_t __rdpq_resolve_mode(const rdpq_state_mirror_t *m)
 
 void __rdpq_frozen_emit_resolved_mode(void)
 {
+    rdpq_block_state.mirror_written |= RDPQ_MIRROR_MODE;
+    __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_OTHER_MODES | RDPQ_WRITE_READS_COMBINER | RDPQ_WRITE_READS_BLENDER;
     __rdpq_resolved_t r = __rdpq_resolve_mode(&rdpq_state_mirror);
+    rdpq_tracking.cycle_type_known = (r.som & SOM_CYCLE_COPY) ? 2 : 1;
 
     /* The rdpq_passthrough_write macro packs the cmd id into the top byte of
      * the first word, producing a valid RDP command in the static buffer:
@@ -297,6 +300,7 @@ void __rdpq_frozen_publish_post_state(unsigned int groups)
  * RSP-side resolver). */
 void __rdpq_frozen_sync_dmem(unsigned int groups)
 {
+    __rdpq_frozen_flush_pending_mode();
     unsigned int todo = groups & __rdpq_frozen_dmem_pending;
     if (todo) {
       __rdpq_frozen_publish_post_state(todo);
@@ -306,6 +310,8 @@ void __rdpq_frozen_sync_dmem(unsigned int groups)
 
 void __rdpq_frozen_emit_scissor_adjusted(void)
 {
+    rdpq_block_state.mirror_written |= RDPQ_MIRROR_SCISSOR;
+    __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_SCISSOR;
     /* Scissor: write current mirror.scissor, adjusting bottom-right by -1
      * subpixel in FILL/COPY mode (matches RDPQ_WriteSetScissor). */
     uint64_t sc = rdpq_state_mirror.scissor;
@@ -318,6 +324,8 @@ void __rdpq_frozen_emit_scissor_adjusted(void)
 
 void __rdpq_frozen_emit_raw_som_and_scissor(void)
 {
+    rdpq_block_state.mirror_written |= RDPQ_MIRROR_MODE;
+    __rdpq_frozen_dmem_pending |= RDPQ_WRITE_READS_OTHER_MODES;
     uint64_t som = rdpq_state_mirror.som & 0x00FFFFFFFFFFFFFFULL;
     rdpq_passthrough_write((RDPQ_CMD_SET_OTHER_MODES,
         (uint32_t)(som >> 32) & 0x00FFFFFF, (uint32_t)som));
@@ -429,6 +437,7 @@ __attribute__((noinline))
 void __rdpq_reset_render_mode(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3)
 {
     __rdpq_autosync_change(AUTOSYNC_PIPE);
+    uint64_t previous_som = rdpq_state_mirror.som;
 
     // CPU mirror: ResetRenderMode rewrites both CC (w0|w1) and SOM (w2|w3),
     // and resets the mipmap mask. (It is used by rdpq_set_mode_standard /
@@ -441,8 +450,9 @@ void __rdpq_reset_render_mode(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3
     rdpq_state_mirror.blender_steps[1] = 0;
 
     if (rdpq_block_state.frozen) {
-        // Reset emits SET_SCISSOR (with cycle adjustment) to match the RSP path.
-        __rdpq_frozen_emit_scissor_adjusted();
+        // Preserve runtime clipping unless the cycle type changes its encoding.
+        if ((previous_som ^ rdpq_state_mirror.som) & SOM_CYCLE_COPY)
+            __rdpq_frozen_emit_scissor_adjusted();
         // The resolved CC+SOM emit is deferred if inside a mode_begin/end batch.
         __rdpq_frozen_mode_pending = true;
         return;
@@ -487,6 +497,7 @@ void rdpq_mode_push(void)
 void rdpq_mode_pop(void)
 {
     __rdpq_autosync_change(AUTOSYNC_PIPE);
+    uint64_t previous_som = rdpq_state_mirror.som;
 
     // Restore the saved mirror to match what RSP-side pop will load from
     // RDPQ_MODE_STACK. Without this, cycle-type bits and other SOM state
@@ -503,7 +514,8 @@ void rdpq_mode_pop(void)
     // directly as raw RDP commands. No rspq overlay command needed. The
     // resolved mode emit is coalesced if inside a mode_begin/end batch.
     if (rdpq_block_state.frozen) {
-        __rdpq_frozen_emit_scissor_adjusted();
+        if ((previous_som ^ rdpq_state_mirror.som) & SOM_CYCLE_COPY)
+            __rdpq_frozen_emit_scissor_adjusted();
         __rdpq_frozen_mode_pending = true;
         return;
     }
