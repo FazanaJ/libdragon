@@ -785,6 +785,9 @@ void __rdpq_block_next_buffer(void)
         // Set write pointer and sentinel for the new buffer
         st->wptr = b->cmds;
         st->wend = b->cmds + st->bufsize;
+
+        // Grow only when advancing to another node, not when restoring a pending buffer.
+        if (st->bufsize < RDPQ_BLOCK_MAX_SIZE) st->bufsize *= 2;
     }
 
     assertf((PhysicalAddr(st->wptr) & 0x7) == 0,
@@ -801,11 +804,6 @@ void __rdpq_block_next_buffer(void)
     // new buffer (though with DP_START==DP_END, as the buffer is currently empty).
     rspq_int_write(RSPQ_CMD_RDP_SET_BUFFER,
         PhysicalAddr(st->wptr), PhysicalAddr(st->wptr), PhysicalAddr(st->wend));
-
-    // Grow size for next buffer
-    // We use doubling here to reduce overheads for large blocks
-    // and at the same time start small.
-    if (st->bufsize < RDPQ_BLOCK_MAX_SIZE) st->bufsize *= 2;
 }
 
 /**
